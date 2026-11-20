@@ -5,8 +5,9 @@ attendance, drag-and-drop crew tracking, break groups, supervisor view and
 end-of-shift minutes by line.
 
 Run:  streamlit run floor_board.py
-Demo: sample names, memory only (a page refresh resets it). Load the real crew
-sheet, line requirements and usual layout in Setup (Excel template included).
+Demo: memory only (a page refresh resets it). Crews, line requirements, usual
+layout and logins come from floor_board_setup.xlsx next to this file (sheets Crew,
+Lines, Logins). Without that file the app uses made-up sample data.
 
 Moving into the Schedule Board app: add `pages()` to its st.navigation, e.g.
     st.navigation({"Schedule": [...], "Floor Board": floor_board.pages()})
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import io
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -28,7 +30,7 @@ from streamlit_sortables import sort_items
 TZ = ZoneInfo("America/Chicago")
 
 FLOORS = {"fill": "Fill", "pack": "Pack"}
-SHIFTS = {"1st": time(6, 0), "2nd": time(16, 0)}  # 1st 6 AM–4 PM, 2nd 4 PM–6 AM (dated by its start)
+SHIFTS = {"1st": time(6, 0), "2nd": time(16, 0)}  # 1st 6 AM–4 PM; 2nd 4 PM–end of night (2–3 AM), dated by its start day
 
 LINES = [{"id": "KIT", "name": "Kit Line", "short": "Kit"}] + \
         [{"id": f"L{n}", "name": f"Line {n}", "short": f"L{n}"} for n in range(1, 19)]
@@ -46,7 +48,9 @@ BREAK_GROUPS = {
     "B": {"label": "lines 10 – 17", "areas": [f"L{n}" for n in range(10, 18)]},
 }
 
-# Demo logins. group None = supervisor (both floors, all lines).
+DATA_FILE = Path(__file__).with_name("floor_board_setup.xlsx")
+
+# Sample logins (used when there is no setup file). group None = supervisor (both floors, all lines).
 USERS = [
     {"name": "A. Rivera", "pin": "1111", "floor": "fill", "group": "A"},
     {"name": "B. Lopez", "pin": "1112", "floor": "fill", "group": "B"},
@@ -94,12 +98,13 @@ AUTH_KEY = "floor_board_auth"
 
 def get_state() -> dict:
     if STATE_KEY not in st.session_state:
-        roster, reqs = _sample_setup()
+        roster, reqs, users, errors = load_setup()
         today = datetime.now(TZ).date()
         st.session_state[STATE_KEY] = {
             "roster": roster,  # {"floor", "shift", "name", "line"}
             "reqs": reqs,      # (floor, shift, line_id) -> required people
-            "users": [dict(u) for u in USERS],
+            "users": users,
+            "setup_errors": errors,
             "boards": {},      # "YYYY-MM-DD|shift|floor" -> board
             "clock_mode": "demo",
             "demo_now": datetime.combine(today, SHIFTS["1st"], tzinfo=TZ),
@@ -514,6 +519,16 @@ def _floor_picker(key: str, default: str = "fill") -> str:
                                 key=f"floor_{key}", required=True) or default
 
 
+def _history_pickers(u: dict, key: str) -> tuple[str, date, str]:
+    """Supervisors pick any floor, day and shift; leads see their own floor's current shift."""
+    if u["group"] is None:
+        floor = _floor_picker(key)
+        d, s = _slot_picker(key)
+        return floor, d, s
+    d, s = current_slot()
+    return u["floor"], d, s
+
+
 def _title(b: dict, title: str) -> None:
     live = (b["date"], b["shift"]) == current_slot() and not b["ended"]
     tags = f"<span class='fb-tag'>{FLOORS[b['floor']].upper()}</span> " \
@@ -564,10 +579,10 @@ def _read_only_board(b: dict, areas: list[dict]) -> None:
 
 def _view(floor: str) -> None:
     st.markdown(CSS, unsafe_allow_html=True)
-    d, s = _slot_picker(f"view_{floor}")
 
     @st.fragment(run_every="10s")
     def _live() -> None:
+        d, s = current_slot()
         b = get_board(d, s, floor)
         _title(b, "Floor view")
         _pills(b)
@@ -644,13 +659,12 @@ def update_page() -> None:
     if not u:
         return
     by = u["name"]
-    if u["group"] is None:  # supervisor: any floor / day / shift, all lines
+    d, s = current_slot()  # only the current shift can be changed
+    if u["group"] is None:  # supervisor: either floor, all lines
         floor = _floor_picker("update")
-        d, s = _slot_picker("update")
         groups = list(LEAD_GROUPS)
     else:
         floor = u["floor"]
-        d, s = current_slot()
         groups = [u["group"]]
     b = get_board(d, s, floor)
     areas = [AREA_BY_ID[a] for g in groups for a in LEAD_GROUPS[g]["areas"]] + [BREAK]
@@ -710,8 +724,7 @@ def supervisor_page() -> None:
     u = require_login("see the supervisor view")
     if not u:
         return
-    floor = _floor_picker("sup", default=u["floor"] or "fill")
-    d, s = _slot_picker("sup")
+    floor, d, s = _history_pickers(u, "sup")
     b = get_board(d, s, floor)
     _title(b, "Supervisor view")
 
@@ -767,8 +780,7 @@ def summary_page() -> None:
     u = require_login("see the end of shift report")
     if not u:
         return
-    floor = _floor_picker("eos", default=u["floor"] or "fill")
-    d, s = _slot_picker("eos")
+    floor, d, s = _history_pickers(u, "eos")
     b = get_board(d, s, floor)
     _title(b, "End of shift")
     if not b["confirmed"]:
@@ -807,20 +819,7 @@ def summary_page() -> None:
     st.dataframe(pd.DataFrame(log_rows), hide_index=True, width="stretch")
 
 
-# ---------- setup (supervisors) ----------
-
-def _template_xlsx() -> bytes:
-    g = get_state()
-    crew_df = pd.DataFrame([{"Floor": FLOORS[r["floor"]], "Shift": r["shift"], "Name": r["name"],
-                             "Usual line": AREA_BY_ID[r["line"]]["name"]} for r in g["roster"]])
-    lines_df = pd.DataFrame([{"Floor": FLOORS[f], "Shift": s, "Line": AREA_BY_ID[l]["name"], "Required": n}
-                             for (f, s, l), n in g["reqs"].items()])
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        crew_df.to_excel(xw, sheet_name="Crew", index=False)
-        lines_df.to_excel(xw, sheet_name="Lines", index=False)
-    return buf.getvalue()
-
+# ---------- setup file (crews, line requirements, usual layout, logins) ----------
 
 def _norm_floor(v) -> str | None:
     v = str(v).strip().lower()
@@ -834,96 +833,86 @@ def _norm_shift(v) -> str | None:
 
 def _norm_line(v) -> str | None:
     v = str(v).strip().lower().replace("line", "").strip()
-    if v in ("kit", "kit line", "k"):
+    if v in ("kit", "k"):
         return "KIT"
     v = v.lstrip("l").strip()
-    return f"L{int(float(v))}" if v.replace(".", "", 1).isdigit() and 1 <= int(float(v)) <= 18 else None
+    try:
+        n = int(float(v))
+    except ValueError:
+        return None
+    return f"L{n}" if 1 <= n <= 18 else None
 
 
-def _import_xlsx(data) -> tuple[list[dict], dict, list[str]]:
-    sheets = pd.read_excel(data, sheet_name=None)
-    errors, roster, reqs = [], [], {}
-    crew_df, lines_df = sheets.get("Crew"), sheets.get("Lines")
-    if crew_df is None or lines_df is None:
-        return [], {}, ["The file needs two sheets named Crew and Lines (download the template)."]
-    for i, r in crew_df.iterrows():
-        f, s, l = _norm_floor(r.get("Floor")), _norm_shift(r.get("Shift")), _norm_line(r.get("Usual line"))
+def _norm_group(v) -> str | None | bool:
+    v = str(v).strip().lower()
+    if v.startswith("sup") or v in ("all", "both"):
+        return None
+    if "kit" in v or v.startswith("a"):
+        return "A"
+    if "10" in v or v.startswith("b"):
+        return "B"
+    return False
+
+
+def _pin(v) -> str:
+    try:
+        return str(int(float(v)))
+    except (TypeError, ValueError):
+        return str(v).strip()
+
+
+def load_setup(path: Path = DATA_FILE) -> tuple[list[dict], dict, list[dict], list[str]]:
+    """Read floor_board_setup.xlsx (sheets Crew, Lines, Logins). Falls back to sample data."""
+    if not path.exists():
+        roster, reqs = _sample_setup()
+        return roster, reqs, [dict(u) for u in USERS], []
+    sheets = pd.read_excel(path, sheet_name=None)
+    errors, roster, reqs, users = [], [], {}, []
+    for i, r in sheets.get("Crew", pd.DataFrame()).iterrows():
         name = str(r.get("Name", "")).strip()
         if not name or name == "nan":
             continue
-        if not (f and s and l):
+        f, s, l = _norm_floor(r.get("Floor")), _norm_shift(r.get("Shift")), _norm_line(r.get("Usual line"))
+        if f and s and l:
+            roster.append({"floor": f, "shift": s, "name": name, "line": l})
+        else:
             errors.append(f"Crew row {i + 2}: check Floor / Shift / Usual line for {name}")
-            continue
-        roster.append({"floor": f, "shift": s, "name": name, "line": l})
-    for i, r in lines_df.iterrows():
+    for i, r in sheets.get("Lines", pd.DataFrame()).iterrows():
         f, s, l = _norm_floor(r.get("Floor")), _norm_shift(r.get("Shift")), _norm_line(r.get("Line"))
-        if not (f and s and l) or pd.isna(r.get("Required")):
+        if f and s and l and not pd.isna(r.get("Required")):
+            reqs[(f, s, l)] = int(r["Required"])
+        else:
             errors.append(f"Lines row {i + 2}: check Floor / Shift / Line / Required")
+    for i, r in sheets.get("Logins", pd.DataFrame()).iterrows():
+        name = str(r.get("Name", "")).strip()
+        if not name or name == "nan":
             continue
-        reqs[(f, s, l)] = int(r["Required"])
-    return roster, reqs, errors
+        grp, f = _norm_group(r.get("Lines")), _norm_floor(r.get("Floor"))
+        if grp is False or (grp is not None and not f):
+            errors.append(f"Logins row {i + 2}: check Floor / Lines for {name}")
+            continue
+        users.append({"name": name, "pin": _pin(r.get("PIN")), "floor": f if grp else None, "group": grp})
+    if not roster:
+        errors.append("No crew found in the Crew sheet; using sample data.")
+        roster, reqs = _sample_setup()
+    if not users:
+        errors.append("No logins found in the Logins sheet; using sample logins.")
+        users = [dict(u) for u in USERS]
+    return roster, reqs, users, errors
 
 
-def setup_page() -> None:
-    st.markdown(CSS, unsafe_allow_html=True)
-    u = require_login("change the setup", supervisors_only=True)
-    if not u:
-        return
-    g = get_state()
-    st.markdown("### Setup")
-
-    st.markdown("**Crew sheets, line requirements and usual layout**")
-    st.caption("One Excel file, two sheets. **Crew:** Floor, Shift, Name, Usual line. **Lines:** Floor, Shift, Line, "
-               "Required. Floor = Fill or Pack · Shift = 1st or 2nd · Line = Kit Line or Line 1–18.")
-    c1, c2 = st.columns([1, 2])
-    c1.download_button("Download template (current data)", _template_xlsx(), "floor_board_setup.xlsx",
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
-    up = c2.file_uploader("Upload crew sheet", type=["xlsx"], label_visibility="collapsed")
-    if up is not None and st.button("Load this file", type="primary"):
-        roster, reqs, errors = _import_xlsx(up)
-        if roster:
-            g["roster"], g["reqs"] = roster, {**{k: 0 for k in g["reqs"]}, **reqs}
-            rebuilt = [k for k, bd in g["boards"].items() if not bd["confirmed"]]
-            for k in rebuilt:
-                del g["boards"][k]
-            st.success(f"Loaded {len(roster)} people and {len(reqs)} line requirements. "
-                       "Shifts already started keep their crew; new shifts use this file.")
-        for e in errors[:15]:
-            st.warning(e)
-
-    counts = pd.DataFrame(g["roster"]).groupby(["floor", "shift"]).size()
-    st.caption("Current crews: " + " · ".join(f"{FLOORS[f]} {s}: {n}" for (f, s), n in counts.items()))
-
-    st.markdown("**Logins**")
-    group_names = {**{k: v["label"] for k, v in LEAD_GROUPS.items()}, "": "Supervisor (all)"}
-    users = st.data_editor(
-        pd.DataFrame([{"Name": x["name"], "PIN": str(x["pin"]),
-                       "Floor": FLOORS[x["floor"]] if x["floor"] else "Both",
-                       "Lines": group_names[x["group"] or ""]} for x in g["users"]]),
-        hide_index=True, num_rows="dynamic", key="users_editor", width="stretch",
-        column_config={"Floor": st.column_config.SelectboxColumn(options=["Fill", "Pack", "Both"], required=True),
-                       "Lines": st.column_config.SelectboxColumn(options=list(group_names.values()), required=True)},
-    )
-    if st.button("Save logins"):
-        floor_back = {"Fill": "fill", "Pack": "pack", "Both": None}
-        group_back = {v: (k or None) for k, v in group_names.items()}
-        new = []
-        for _, r in users.iterrows():
-            if isinstance(r["Name"], str) and r["Name"].strip():
-                grp = group_back.get(r["Lines"])
-                new.append({"name": r["Name"].strip(), "pin": str(r["PIN"]),
-                            "floor": None if grp is None else floor_back.get(r["Floor"]) or "fill", "group": grp})
-        g["users"] = new
-        st.success("Logins saved.")
-
-    st.divider()
-    st.markdown("**Demo**")
-    g["clock_mode"] = st.radio("Clock", ["demo", "real"], index=["demo", "real"].index(g["clock_mode"]), horizontal=True,
-                               format_func=lambda v: "Demo clock (sidebar buttons)" if v == "demo" else "Real time")
-    if st.button("Reset demo"):
-        reset()
-        logout()
-        st.rerun()
+def write_setup_template(path: Path) -> None:
+    """Writes the setup file filled with the sample data, to edit with the real crews."""
+    roster, reqs = _sample_setup()
+    group_names = {**{k: v["label"] for k, v in LEAD_GROUPS.items()}, None: "Supervisor"}
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        pd.DataFrame([{"Floor": FLOORS[r["floor"]], "Shift": r["shift"], "Name": r["name"],
+                       "Usual line": AREA_BY_ID[r["line"]]["name"]} for r in roster]
+                     ).to_excel(xw, sheet_name="Crew", index=False)
+        pd.DataFrame([{"Floor": FLOORS[f], "Shift": s, "Line": AREA_BY_ID[l]["name"], "Required": n}
+                      for (f, s, l), n in reqs.items()]).to_excel(xw, sheet_name="Lines", index=False)
+        pd.DataFrame([{"Name": u["name"], "PIN": u["pin"], "Floor": FLOORS[u["floor"]] if u["floor"] else "Both",
+                       "Lines": group_names[u["group"]]} for u in USERS]).to_excel(xw, sheet_name="Logins", index=False)
 
 
 # ================= navigation =================
@@ -935,11 +924,20 @@ def _sidebar() -> None:
         st.markdown("**Floor Board demo**")
         st.caption("Memory only: refreshing the page resets the demo.")
         st.markdown(f"Now: **{fmt_day(d)} · {s} shift · {fmt(now())}**")
-        if g["clock_mode"] == "demo":
+        real = st.toggle("Real time", value=g["clock_mode"] == "real")
+        g["clock_mode"] = "real" if real else "demo"
+        if not real:
             b1, b2, b3 = st.columns(3)
             b1.button("+15 min", on_click=advance_clock, args=(15,), width="stretch")
             b2.button("+1 h", on_click=advance_clock, args=(60,), width="stretch")
             b3.button("Next shift", on_click=jump_to_next_shift, width="stretch")
+        st.caption("Data: " + (DATA_FILE.name if DATA_FILE.exists() else "sample (no floor_board_setup.xlsx found)"))
+        for err in g["setup_errors"][:10]:
+            st.warning(err)
+        if st.button("Reset demo", width="stretch"):
+            reset()
+            logout()
+            st.rerun()
         u = current_user()
         if u:
             st.divider()
@@ -955,7 +953,6 @@ def pages() -> list:
         st.Page(update_page, title="Update", icon=":material/edit:", url_path="floor-update"),
         st.Page(supervisor_page, title="Supervisor view", icon=":material/lock:", url_path="supervisor"),
         st.Page(summary_page, title="End of shift", icon=":material/lock:", url_path="end-of-shift"),
-        st.Page(setup_page, title="Setup", icon=":material/settings:", url_path="floor-setup"),
     ]
 
 
