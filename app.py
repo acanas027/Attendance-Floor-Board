@@ -1,10 +1,12 @@
 """Floor Board — demo.
 
-Live crew board for the Fill and Pack floors: start-of-shift attendance, tap-to-move
-crew tracking, break groups, supervisor view and end-of-shift minutes by area.
+Live crew board for the Fill and Pack floors, by day and shift: start-of-shift
+attendance, drag-and-drop crew tracking, break groups, supervisor view and
+end-of-shift minutes by line.
 
 Run:  streamlit run floor_board.py
-Demo: sample names, memory only (a page refresh resets it).
+Demo: sample names, memory only (a page refresh resets it). Load the real crew
+sheet, line requirements and usual layout in Setup (Excel template included).
 
 Moving into the Schedule Board app: add `pages()` to its st.navigation, e.g.
     st.navigation({"Schedule": [...], "Floor Board": floor_board.pages()})
@@ -13,202 +15,138 @@ and replace get_state()/_save() with Google Sheets reads/writes.
 
 from __future__ import annotations
 
-import copy
-from datetime import datetime, timedelta
+import io
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+from streamlit_sortables import sort_items
 
-# ================= sample data =================
+# ================= configuration =================
 
-ROLES = {
-    "Operator": "#60A5FA",
-    "Assistant": "#FBBF24",
-    "Palletizer": "#2DD4BF",
-    "Kit line": "#C4B5FD",
+TZ = ZoneInfo("America/Chicago")
+
+FLOORS = {"fill": "Fill", "pack": "Pack"}
+SHIFTS = {"1st": time(6, 0), "2nd": time(16, 0)}  # 1st 6 AM–4 PM, 2nd 4 PM–6 AM (dated by its start)
+
+LINES = [{"id": "KIT", "name": "Kit Line", "short": "Kit"}] + \
+        [{"id": f"L{n}", "name": f"Line {n}", "short": f"L{n}"} for n in range(1, 19)]
+BREAK = {"id": "BRK", "name": "Break", "short": "Break"}
+AREAS = LINES + [BREAK]
+
+# Each lead owns one group of lines on their floor.
+LEAD_GROUPS = {
+    "A": {"label": "Kit Line – 9", "areas": ["KIT"] + [f"L{n}" for n in range(1, 10)]},
+    "B": {"label": "Lines 10 – 18", "areas": [f"L{n}" for n in range(10, 19)]},
 }
-
-LINE_IDS = [f"L{n}" for n in range(1, 19)]
-AREA_TEMPLATE = (
-    [{"id": "KIT", "name": "Kit Line", "short": "Kit"}]
-    + [{"id": i, "name": f"Line {i[1:]}", "short": i} for i in LINE_IDS]
-    + [{"id": "PAL", "name": "Palletizing", "short": "Pallet"},
-       {"id": "BRK", "name": "Break", "short": "Break"}]
-)
-
-# Break groups for the two break buttons.
+# The two break buttons.
 BREAK_GROUPS = {
     "A": {"label": "lines Kit Line – 9", "areas": ["KIT"] + [f"L{n}" for n in range(1, 10)]},
     "B": {"label": "lines 10 – 17", "areas": [f"L{n}" for n in range(10, 18)]},
 }
 
-FLOORS = {
-    "fill": {
-        "name": "Fill",
-        "lead": "A. Rivera",
-        "std": {**{i: 2 for i in LINE_IDS}, "L3": 3, "L7": 3, "L10": 3, "L15": 3, "KIT": 5, "PAL": 6, "BRK": None},
-        "employees": [
-            ("Maria R.", "Operator", "L1"), ("Jose L.", "Operator", "L1"),
-            ("Ana P.", "Operator", "L2"), ("Luis G.", "Operator", "L2"),
-            ("Carmen D.", "Operator", "L3"), ("Pedro S.", "Operator", "L3"), ("Sofia M.", "Assistant", "L3"),
-            ("Juan C.", "Operator", "L4"), ("Rosa T.", "Operator", "L4"),
-            ("Miguel A.", "Operator", "L5"), ("Elena V.", "Operator", "L5"),
-            ("Diego F.", "Operator", "L6"), ("Laura B.", "Operator", "L6"),
-            ("Carlos N.", "Operator", "L7"), ("Teresa G.", "Operator", "L7"), ("Emilio P.", "Assistant", "L7"),
-            ("Isabel Q.", "Operator", "L8"), ("Jorge H.", "Operator", "L8"),
-            ("Lucia K.", "Operator", "L9"), ("Raul E.", "Operator", "L9"),
-            ("Paula W.", "Operator", "L10"), ("Tomas Y.", "Operator", "L10"), ("Hector Z.", "Assistant", "L10"),
-            ("Daniel O.", "Operator", "L11"), ("Marta I.", "Operator", "L11"),
-            ("Sergio V.", "Operator", "L12"), ("Andrea F.", "Operator", "L12"),
-            ("Victor U.", "Operator", "L13"), ("Silvia J.", "Operator", "L13"),
-            ("Pablo X.", "Operator", "L14"), ("Teresa M.", "Operator", "L14"),
-            ("Ramon G.", "Operator", "L15"), ("Alicia C.", "Operator", "L15"), ("Ruben L.", "Assistant", "L15"),
-            ("Gloria P.", "Operator", "L16"), ("Fernando D.", "Operator", "L16"),
-            ("Adrian S.", "Operator", "L17"), ("Beatriz N.", "Operator", "L17"),
-            ("Hugo R.", "Operator", "L18"), ("Nora T.", "Operator", "L18"),
-            ("Irene A.", "Kit line", "KIT"), ("Oscar B.", "Kit line", "KIT"), ("Clara E.", "Kit line", "KIT"),
-            ("Felipe G.", "Kit line", "KIT"), ("Ines H.", "Kit line", "KIT"),
-            ("Mateo I.", "Palletizer", "PAL"), ("Julia K.", "Palletizer", "PAL"), ("Samuel L.", "Palletizer", "PAL"),
-            ("Rocio M.", "Palletizer", "PAL"), ("Ivan N.", "Palletizer", "PAL"), ("Lorena O.", "Palletizer", "PAL"),
-        ],
-    },
-    "pack": {
-        "name": "Pack",
-        "lead": "M. Torres",
-        "std": {**{i: 2 for i in LINE_IDS}, "L5": 3, "L12": 3, "KIT": 4, "PAL": 4, "BRK": None},
-        "employees": [
-            ("Alma B.", "Operator", "L1"), ("Bruno C.", "Operator", "L1"),
-            ("Celia D.", "Operator", "L2"), ("Dario E.", "Operator", "L2"),
-            ("Eva F.", "Operator", "L3"), ("Fabian G.", "Operator", "L3"),
-            ("Gina H.", "Operator", "L4"), ("Ivan J.", "Operator", "L4"),
-            ("Jana K.", "Operator", "L5"), ("Kevin L.", "Operator", "L5"), ("Lidia M.", "Assistant", "L5"),
-            ("Mario N.", "Operator", "L6"), ("Nadia O.", "Operator", "L6"),
-            ("Omar P.", "Operator", "L7"), ("Patricia Q.", "Operator", "L7"),
-            ("Quique R.", "Operator", "L8"), ("Rita S.", "Operator", "L8"),
-            ("Saul T.", "Operator", "L9"), ("Tania U.", "Operator", "L9"),
-            ("Ulises V.", "Operator", "L10"), ("Vera W.", "Operator", "L10"),
-            ("Walter X.", "Operator", "L11"), ("Ximena Y.", "Operator", "L11"),
-            ("Yago Z.", "Operator", "L12"), ("Zoe A.", "Operator", "L12"), ("Abel B.", "Assistant", "L12"),
-            ("Berta C.", "Operator", "L13"), ("Cesar D.", "Operator", "L13"),
-            ("Dalia E.", "Operator", "L14"), ("Efren F.", "Operator", "L14"),
-            ("Flor G.", "Operator", "L15"), ("Gabriel H.", "Operator", "L15"),
-            ("Hilda I.", "Operator", "L16"), ("Ignacio J.", "Operator", "L16"),
-            ("Julieta K.", "Operator", "L17"), ("Kike L.", "Operator", "L17"),
-            ("Lorenzo M.", "Operator", "L18"), ("Marisol N.", "Operator", "L18"),
-            ("Noemi O.", "Kit line", "KIT"), ("Oscar P.", "Kit line", "KIT"),
-            ("Pilar Q.", "Kit line", "KIT"), ("Rafael R.", "Kit line", "KIT"),
-            ("Selena S.", "Palletizer", "PAL"), ("Tobias T.", "Palletizer", "PAL"),
-            ("Ursula U.", "Palletizer", "PAL"), ("Vicente V.", "Palletizer", "PAL"),
-        ],
-    },
-}
-
-# Demo logins. Leads open their own floor; supervisors pick a floor.
+# Demo logins. group None = supervisor (both floors, all lines).
 USERS = [
-    {"name": "A. Rivera", "pin": "1111", "role": "Lead", "floor": "fill"},
-    {"name": "M. Torres", "pin": "2222", "role": "Lead", "floor": "pack"},
-    {"name": "D. Morgan", "pin": "9999", "role": "Supervisor", "floor": None},
+    {"name": "A. Rivera", "pin": "1111", "floor": "fill", "group": "A"},
+    {"name": "B. Lopez", "pin": "1112", "floor": "fill", "group": "B"},
+    {"name": "M. Torres", "pin": "2221", "floor": "pack", "group": "A"},
+    {"name": "C. Diaz", "pin": "2222", "floor": "pack", "group": "B"},
+    {"name": "D. Morgan", "pin": "9999", "floor": None, "group": None},
 ]
 LOGIN_HOURS = 12
-
-SHIFTS = {"1st shift": (6, 0), "2nd shift": (16, 0)}
 CHECK_EVERY_MIN = 120
 
-# ================= state and rules =================
+AREA_BY_ID = {a["id"]: a for a in AREAS}
+BOX = None  # not on any line = "in the box"
 
-TZ = ZoneInfo("America/Chicago")
-BOX = None  # an employee not on any area is "in the box"
+
+def _sample_setup() -> tuple[list[dict], dict]:
+    """Made-up crews for both floors and shifts. Replaced by the Setup upload."""
+    firsts = ["Maria", "Jose", "Ana", "Luis", "Carmen", "Pedro", "Sofia", "Juan", "Rosa", "Miguel", "Elena", "Diego",
+              "Laura", "Carlos", "Teresa", "Emilio", "Isabel", "Jorge", "Lucia", "Raul", "Paula", "Tomas", "Hector",
+              "Daniel", "Marta", "Sergio", "Andrea", "Victor", "Silvia", "Pablo", "Ramon", "Alicia", "Ruben", "Gloria",
+              "Fernando", "Adrian", "Beatriz", "Hugo", "Nora", "Irene", "Oscar", "Clara", "Felipe", "Ines", "Mateo",
+              "Julia", "Samuel", "Rocio", "Ivan", "Lorena", "Alma", "Bruno", "Celia", "Dario", "Eva", "Fabian"]
+    roster, reqs = [], {}
+    for fi, floor in enumerate(FLOORS):
+        for si, shift in enumerate(SHIFTS):
+            seed = fi * 2 + si
+            need = {"KIT": 4 + (seed % 2)}
+            need.update({f"L{n}": 3 if n in (3 + seed, 10 + seed) else 2 for n in range(1, 19)})
+            for lid, n in need.items():
+                reqs[(floor, shift, lid)] = n
+            k = 0
+            for lid, n in need.items():
+                for _ in range(n):
+                    first = firsts[(k + seed * 7) % len(firsts)]
+                    roster.append({"floor": floor, "shift": shift, "name": f"{first} {chr(65 + (k * 3 + seed) % 26)}.",
+                                   "line": lid})
+                    k += 1
+    return roster, reqs
+
+
+# ================= state =================
+
 STATE_KEY = "floor_board"
 AUTH_KEY = "floor_board_auth"
 
 
-def _fresh_floor(key: str) -> dict:
-    cfg = FLOORS[key]
-    employees = [{"id": f"{key[0].upper()}{i:03d}", "name": n, "role": r, "home": h}
-                 for i, (n, r, h) in enumerate(cfg["employees"], start=1)]
-    areas = [dict(a, std=cfg["std"].get(a["id"])) for a in AREA_TEMPLATE]
-    return {
-        "key": key, "name": cfg["name"], "lead": cfg["lead"],
-        "employees": employees, "areas": areas,
-        "assign": {e["id"]: BOX for e in employees},
-        "selected": None,
-        "attendance_confirmed": False, "attendance_time": None,
-        "attendance": {},      # eid -> {"status": Present|Absent|Late, "time": datetime}
-        "left": {},            # eid -> time sent back to the box after attendance
-        "open": {},            # eid -> (area_id, start)
-        "intervals": [],       # {"eid", "area", "start", "end"}
-        "events": [],          # {"t", "kind", "text"}
-        "break_from": {},      # eid -> area they were on before a group break
-        "group_break": {g: False for g in BREAK_GROUPS},
-        "last_check": None, "checkins": 0,
-        "ended": False, "end_time": None,
-    }
-
-
-def _fresh_state() -> dict:
-    return {
-        "floors": {k: _fresh_floor(k) for k in FLOORS},
-        "users": copy.deepcopy(USERS),
-        "shift": "1st shift",
-        "clock_mode": "demo",  # "demo" = clock moves with the sidebar buttons; "real" = wall clock
-        "demo_minutes": 0,
-    }
-
-
 def get_state() -> dict:
     if STATE_KEY not in st.session_state:
-        st.session_state[STATE_KEY] = _fresh_state()
+        roster, reqs = _sample_setup()
+        today = datetime.now(TZ).date()
+        st.session_state[STATE_KEY] = {
+            "roster": roster,  # {"floor", "shift", "name", "line"}
+            "reqs": reqs,      # (floor, shift, line_id) -> required people
+            "users": [dict(u) for u in USERS],
+            "boards": {},      # "YYYY-MM-DD|shift|floor" -> board
+            "clock_mode": "demo",
+            "demo_now": datetime.combine(today, SHIFTS["1st"], tzinfo=TZ),
+        }
     return st.session_state[STATE_KEY]
 
 
 def reset() -> None:
-    st.session_state[STATE_KEY] = _fresh_state()
+    st.session_state.pop(STATE_KEY, None)
 
 
-def _save(f: dict) -> None:
-    """Live version: write the floor's changes to the backend here. Demo: nothing to do."""
+def _save(b: dict) -> None:
+    """Live version: write the board's changes to the backend here. Demo: nothing to do."""
+    b["rev"] += 1
 
 
-# ---------- lookups ----------
-
-def emp(f: dict, eid: str) -> dict:
-    return next(e for e in f["employees"] if e["id"] == eid)
-
-
-def area(f: dict, aid: str | None) -> dict | None:
-    return next((a for a in f["areas"] if a["id"] == aid), None)
-
-
-def area_short(f: dict, aid: str | None) -> str:
-    return "Box" if aid is BOX else area(f, aid)["short"]
-
-
-def crew(f: dict, aid: str | None) -> list[dict]:
-    return [e for e in f["employees"] if f["assign"].get(e["id"]) == aid]
-
-
-# ---------- clock ----------
-
-def shift_start() -> datetime:
-    h, m = SHIFTS[get_state()["shift"]]
-    today = datetime.now(TZ).date()
-    return datetime(today.year, today.month, today.day, h, m, tzinfo=TZ)
-
+# ---------- clock, days and shifts ----------
 
 def now() -> datetime:
     g = get_state()
-    if g["clock_mode"] == "demo":
-        return shift_start() + timedelta(minutes=g["demo_minutes"])
-    return datetime.now(TZ)
+    return g["demo_now"] if g["clock_mode"] == "demo" else datetime.now(TZ)
 
 
 def advance_clock(minutes: int) -> None:
-    get_state()["demo_minutes"] += minutes
+    get_state()["demo_now"] += timedelta(minutes=minutes)
+
+
+def current_slot(t: datetime | None = None) -> tuple[date, str]:
+    t = t or now()
+    if t.time() < SHIFTS["1st"]:
+        return t.date() - timedelta(days=1), "2nd"
+    return (t.date(), "1st") if t.time() < SHIFTS["2nd"] else (t.date(), "2nd")
+
+
+def jump_to_next_shift() -> None:
+    d, s = current_slot()
+    nxt = datetime.combine(d, SHIFTS["2nd"], tzinfo=TZ) if s == "1st" else \
+        datetime.combine(d + timedelta(days=1), SHIFTS["1st"], tzinfo=TZ)
+    get_state()["demo_now"] = nxt
 
 
 def fmt(t: datetime | None) -> str:
     return "" if t is None else t.strftime("%I:%M %p").lstrip("0")
+
+
+def fmt_day(d: date) -> str:
+    return d.strftime("%a %b %d")
 
 
 def fmt_min(m: float) -> str:
@@ -216,202 +154,258 @@ def fmt_min(m: float) -> str:
     return f"{m // 60}h {m % 60:02d}m"
 
 
-# ---------- actions ----------
+# ---------- boards ----------
 
-def _log(f: dict, kind: str, text: str) -> None:
-    f["events"].insert(0, {"t": now(), "kind": kind, "text": text})
-
-
-def select(f: dict, eid: str) -> None:
-    if not f["ended"]:
-        f["selected"] = None if f["selected"] == eid else eid
+def board_key(d: date, shift: str, floor: str) -> str:
+    return f"{d.isoformat()}|{shift}|{floor}"
 
 
-def cancel_selection(f: dict) -> None:
-    f["selected"] = None
+def _new_board(d: date, shift: str, floor: str) -> dict:
+    g = get_state()
+    people = [r for r in g["roster"] if r["floor"] == floor and r["shift"] == shift]
+    employees = [{"id": f"{floor[0].upper()}{shift[0]}{i:03d}", "name": r["name"], "home": r["line"]}
+                 for i, r in enumerate(people, start=1)]
+    return {
+        "date": d, "shift": shift, "floor": floor, "rev": 0,
+        "employees": employees,
+        "reqs": {l["id"]: g["reqs"].get((floor, shift, l["id"]), 0) for l in LINES},
+        "assign": {e["id"]: BOX for e in employees},
+        "confirmed": {},        # group -> {"by", "t"}
+        "finalized": None,      # time attendance became final (all groups confirmed)
+        "attendance": {},       # eid -> {"status": Present|Absent|Late, "time", "by"}
+        "left": {},             # eid -> time sent back to the box after being present
+        "open": {},             # eid -> (area, start)
+        "intervals": [],        # {"eid", "area", "start", "end"}
+        "events": [],           # {"t", "kind", "text"}
+        "break_from": {},       # eid -> line before a group break
+        "group_break": {g_: False for g_ in BREAK_GROUPS},
+        "last_check": {},       # group -> time
+        "ended": None,          # {"by", "t"}
+    }
 
 
-def _move(f: dict, eid: str, target: str | None, log: bool = True) -> None:
-    """Move one employee. Before attendance is confirmed nothing is timed."""
-    prev = f["assign"][eid]
+def get_board(d: date, shift: str, floor: str) -> dict:
+    g = get_state()
+    k = board_key(d, shift, floor)
+    if k not in g["boards"]:
+        g["boards"][k] = _new_board(d, shift, floor)
+    return g["boards"][k]
+
+
+def emp(b: dict, eid: str) -> dict:
+    return next(e for e in b["employees"] if e["id"] == eid)
+
+
+def crew(b: dict, aid: str | None) -> list[dict]:
+    return [e for e in b["employees"] if b["assign"].get(e["id"]) == aid]
+
+
+def short(aid: str | None) -> str:
+    return "Box" if aid is BOX else AREA_BY_ID[aid]["short"]
+
+
+def group_of(aid: str) -> str | None:
+    return next((g for g, grp in LEAD_GROUPS.items() if aid in grp["areas"]), None)
+
+
+def on_group_break(b: dict, aid: str) -> bool:
+    return any(b["group_break"][g] and aid in grp["areas"] for g, grp in BREAK_GROUPS.items())
+
+
+def is_short(b: dict, aid: str) -> bool:
+    req = b["reqs"].get(aid, 0)
+    return bool(req) and group_of(aid) in b["confirmed"] and not on_group_break(b, aid) and len(crew(b, aid)) < req
+
+
+# ---------- rules ----------
+
+def _log(b: dict, kind: str, text: str) -> None:
+    b["events"].insert(0, {"t": now(), "kind": kind, "text": text})
+
+
+def _timed(b: dict, area: str | None) -> bool:
+    """Time counts on a line once its lead has confirmed; Break counts once anyone has."""
+    if area is BOX:
+        return False
+    return bool(b["confirmed"]) if area == "BRK" else group_of(area) in b["confirmed"]
+
+
+def _move(b: dict, eid: str, target: str | None, by: str, log: bool = True) -> None:
+    prev = b["assign"][eid]
     if prev == target:
         return
-    f["assign"][eid] = target
+    t = now()
+    e = emp(b, eid)
+    b["assign"][eid] = target
     if target != "BRK":
-        f["break_from"].pop(eid, None)
-    if not f["attendance_confirmed"]:
+        b["break_from"].pop(eid, None)
+
+    if eid in b["open"]:
+        a, start = b["open"].pop(eid)
+        b["intervals"].append({"eid": eid, "area": a, "start": start, "end": t})
+    if not _timed(b, target):
+        if target is BOX and eid in b["attendance"]:
+            b["left"][eid] = t
+            if log:
+                _log(b, "left", f"{e['name']} left the floor ({short(prev)} → Box) · {by}")
         return
 
-    t = now()
-    e = emp(f, eid)
-    if eid in f["open"]:
-        a, start = f["open"].pop(eid)
-        f["intervals"].append({"eid": eid, "area": a, "start": start, "end": t})
-    if target is not BOX:
-        f["open"][eid] = (target, t)
-
-    att = f["attendance"][eid]
-    if prev is BOX and target is not BOX:
-        if att["status"] == "Absent":
-            att.update(status="Late", time=t)
-            if log:
-                _log(f, "late", f"{e['name']} arrived late → {area_short(f, target)}")
-        else:
-            f["left"].pop(eid, None)
-            if log:
-                _log(f, "move", f"{e['name']} back on the floor → {area_short(f, target)}")
-    elif target is BOX:
-        f["left"][eid] = t
+    b["open"][eid] = (target, t)
+    att = b["attendance"].get(eid)
+    if att is None:
+        b["attendance"][eid] = {"status": "Present", "time": t, "by": by}
         if log:
-            _log(f, "left", f"{e['name']} left the floor ({area_short(f, prev)} → Box)")
-    elif log:
-        _log(f, "move", f"{e['name']}  {area_short(f, prev)} → {area_short(f, target)}")
-
-
-def move_selected(f: dict, target: str | None) -> None:
-    eid = f["selected"]
-    f["selected"] = None
-    if eid is None or f["ended"]:
-        return
-    _move(f, eid, target)
-    _save(f)
-
-
-def toggle_group_break(f: dict, g: str) -> None:
-    """Send everyone on a break group's lines to Break, or bring them back to the line they left."""
-    if not f["attendance_confirmed"] or f["ended"]:
-        return
-    grp = BREAK_GROUPS[g]
-    f["selected"] = None
-    if not f["group_break"][g]:
-        people = [e for e in f["employees"] if f["assign"][e["id"]] in grp["areas"]]
-        for e in people:
-            prev = f["assign"][e["id"]]
-            _move(f, e["id"], "BRK", log=False)
-            f["break_from"][e["id"]] = prev
-        f["group_break"][g] = True
-        _log(f, "break", f"{grp['label'][0].upper() + grp['label'][1:]} sent to break ({len(people)} people)")
+            _log(b, "move", f"{e['name']} placed on {short(target)} · {by}")
+    elif att["status"] == "Absent":
+        att.update(status="Late", time=t, by=by)
+        if log:
+            _log(b, "late", f"{e['name']} arrived late → {short(target)} · {by}")
     else:
-        back = [eid for eid, a in f["break_from"].items()
-                if a in grp["areas"] and f["assign"][eid] == "BRK"]
+        b["left"].pop(eid, None)
+        if log:
+            _log(b, "move", f"{e['name']}  {short(prev)} → {short(target)} · {by}")
+
+
+def apply_layout(b: dict, layout: dict[str | None, list[str]], by: str) -> int:
+    """Apply a dragged layout {area: [eid, …]}; returns how many people moved."""
+    moved = 0
+    for area, eids in layout.items():
+        for eid in eids:
+            if b["assign"].get(eid) != area:
+                _move(b, eid, area, by)
+                moved += 1
+    if moved:
+        _save(b)
+    return moved
+
+
+def load_usual_layout(b: dict, group: str | None, by: str) -> None:
+    groups = [group] if group else list(LEAD_GROUPS)
+    for g in groups:
+        if g in b["confirmed"]:
+            continue
+        for e in crew(b, BOX):
+            if e["home"] in LEAD_GROUPS[g]["areas"]:
+                _move(b, e["id"], e["home"], by, log=False)
+    _save(b)
+
+
+def confirm_group(b: dict, group: str, by: str) -> None:
+    if group in b["confirmed"] or b["ended"]:
+        return
+    t = now()
+    b["confirmed"][group] = {"by": by, "t": t}
+    b["last_check"][group] = t
+    n = 0
+    for e in b["employees"]:
+        a = b["assign"][e["id"]]
+        if a is not BOX and (a in LEAD_GROUPS[group]["areas"] or a == "BRK") and e["id"] not in b["attendance"]:
+            b["attendance"][e["id"]] = {"status": "Present", "time": t, "by": by}
+            b["open"][e["id"]] = (a, t)
+            n += 1
+    _log(b, "attendance", f"{LEAD_GROUPS[group]['label']} confirmed by {by}: {n} present")
+    if len(b["confirmed"]) == len(LEAD_GROUPS):
+        absent = [e for e in crew(b, BOX) if e["id"] not in b["attendance"]]
+        for e in absent:
+            b["attendance"][e["id"]] = {"status": "Absent", "time": t, "by": by}
+        b["finalized"] = t
+        _log(b, "attendance", f"Attendance final: {len(b['employees']) - len(absent)} present, {len(absent)} absent")
+    _save(b)
+
+
+def toggle_group_break(b: dict, g: str, by: str) -> None:
+    grp = BREAK_GROUPS[g]
+    if group_of(grp["areas"][0]) not in b["confirmed"] or b["ended"]:
+        return
+    label = grp["label"][0].upper() + grp["label"][1:]
+    if not b["group_break"][g]:
+        people = [e for e in b["employees"] if b["assign"][e["id"]] in grp["areas"]]
+        for e in people:
+            prev = b["assign"][e["id"]]
+            _move(b, e["id"], "BRK", by, log=False)
+            b["break_from"][e["id"]] = prev
+        b["group_break"][g] = True
+        _log(b, "break", f"{label} sent to break ({len(people)} people) · {by}")
+    else:
+        back = [eid for eid, a in b["break_from"].items() if a in grp["areas"] and b["assign"][eid] == "BRK"]
         for eid in back:
-            _move(f, eid, f["break_from"][eid], log=False)
-        f["group_break"][g] = False
-        _log(f, "break", f"{grp['label'][0].upper() + grp['label'][1:]} back from break ({len(back)} people)")
-    _save(f)
+            _move(b, eid, b["break_from"][eid], by, log=False)
+        b["group_break"][g] = False
+        _log(b, "break", f"{label} back from break ({len(back)} people) · {by}")
+    _save(b)
 
 
-def load_usual_layout(f: dict) -> None:
-    if not f["attendance_confirmed"]:
-        for e in f["employees"]:
-            f["assign"][e["id"]] = e["home"]
-        f["selected"] = None
+def confirm_board(b: dict, group: str, by: str) -> None:
+    if group not in b["confirmed"] or b["ended"]:
+        return
+    late = check_minutes_left(b, group) < 0
+    b["last_check"][group] = now()
+    _log(b, "check", f"{LEAD_GROUPS[group]['label']} board confirmed by {by}" + (" (late)" if late else ""))
+    _save(b)
 
 
-def clear_board(f: dict) -> None:
-    if not f["attendance_confirmed"]:
-        for e in f["employees"]:
-            f["assign"][e["id"]] = BOX
-        f["selected"] = None
-
-
-def confirm_attendance(f: dict, by: str) -> None:
-    if f["attendance_confirmed"]:
+def end_shift(b: dict, by: str) -> None:
+    if b["ended"] or not b["confirmed"]:
         return
     t = now()
-    present = absent = 0
-    for e in f["employees"]:
-        aid = f["assign"][e["id"]]
-        if aid is BOX:
-            f["attendance"][e["id"]] = {"status": "Absent", "time": t}
-            absent += 1
-        else:
-            f["attendance"][e["id"]] = {"status": "Present", "time": t}
-            f["open"][e["id"]] = (aid, t)
-            present += 1
-    f.update(attendance_confirmed=True, attendance_time=t, last_check=t, selected=None)
-    _log(f, "attendance", f"Attendance confirmed by {by}: {present} present, {absent} absent")
-    _save(f)
-
-
-def confirm_board(f: dict, by: str) -> None:
-    if not f["attendance_confirmed"] or f["ended"]:
-        return
-    on_time = check_minutes_left(f) >= 0
-    f["last_check"] = now()
-    f["checkins"] += 1 if on_time else 0
-    _log(f, "check", f"Board confirmed correct by {by}" + ("" if on_time else " (late)"))
-    _save(f)
-
-
-def end_shift(f: dict, by: str) -> None:
-    if not f["attendance_confirmed"] or f["ended"]:
-        return
-    t = now()
-    for eid, (a, start) in list(f["open"].items()):
-        f["intervals"].append({"eid": eid, "area": a, "start": start, "end": t})
-    f["open"].clear()
-    f.update(ended=True, end_time=t, selected=None)
-    _log(f, "end", f"Shift ended by {by} · all times closed")
-    _save(f)
+    for eid, (a, start) in list(b["open"].items()):
+        b["intervals"].append({"eid": eid, "area": a, "start": start, "end": t})
+    b["open"].clear()
+    if not b["finalized"]:  # a lead never confirmed: everyone still in the box is absent
+        for e in crew(b, BOX):
+            b["attendance"].setdefault(e["id"], {"status": "Absent", "time": t, "by": by})
+        b["finalized"] = t
+    b["ended"] = {"by": by, "t": t}
+    _log(b, "end", f"Shift ended by {by} · all times closed")
+    _save(b)
 
 
 # ---------- read models ----------
 
-def check_minutes_left(f: dict) -> int:
-    if not f["attendance_confirmed"] or f["last_check"] is None:
+def check_minutes_left(b: dict, group: str) -> int:
+    last = b["last_check"].get(group)
+    if last is None:
         return CHECK_EVERY_MIN
-    due = f["last_check"] + timedelta(minutes=CHECK_EVERY_MIN)
-    return int((due - now()).total_seconds() // 60)
+    return int((last + timedelta(minutes=CHECK_EVERY_MIN) - now()).total_seconds() // 60)
 
 
-def minutes_by_area(f: dict, eid: str) -> dict[str, float]:
+def minutes_by_area(b: dict, eid: str) -> dict[str, float]:
     out: dict[str, float] = {}
-    for iv in f["intervals"]:
+    for iv in b["intervals"]:
         if iv["eid"] == eid:
             out[iv["area"]] = out.get(iv["area"], 0) + (iv["end"] - iv["start"]).total_seconds() / 60
-    if eid in f["open"]:
-        a, start = f["open"][eid]
+    if eid in b["open"]:
+        a, start = b["open"][eid]
         out[a] = out.get(a, 0) + max(0.0, (now() - start).total_seconds() / 60)
     return out
 
 
-def summary_rows(f: dict) -> list[dict]:
+def attendance_label(b: dict, eid: str) -> str:
+    att = b["attendance"].get(eid)
+    if att is None:
+        return "Not placed yet"
+    s = att["status"] if att["status"] != "Late" else f"Late ({fmt(att['time'])})"
+    if eid in b["left"]:
+        s += f" · left {fmt(b['left'][eid])}"
+    return s
+
+
+def absent_list(b: dict) -> list[dict]:
+    return [e for e in b["employees"] if b["attendance"].get(e["id"], {}).get("status") == "Absent"]
+
+
+def summary_rows(b: dict) -> list[dict]:
     rows = []
-    for e in f["employees"]:
-        att = f["attendance"].get(e["id"], {})
-        status = att.get("status", "Not confirmed")
-        if status == "Late":
-            status = f"Late ({fmt(att['time'])})"
-        if e["id"] in f["left"]:
-            status += f" · left {fmt(f['left'][e['id']])}"
-        mins = minutes_by_area(f, e["id"])
+    for e in b["employees"]:
+        mins = minutes_by_area(b, e["id"])
         brk = mins.pop("BRK", 0)
         rows.append({
-            "Employee": e["name"], "Role": e["role"], "Attendance": status, "areas": mins,
-            "Time by area": " · ".join(f"{area_short(f, a)} {fmt_min(m)}" for a, m in mins.items() if m >= 1),
-            "Break": fmt_min(brk) if brk >= 1 else "",
-            "Worked": fmt_min(sum(mins.values())),
+            "Employee": e["name"], "Usual line": AREA_BY_ID[e["home"]]["name"] if e["home"] in AREA_BY_ID else "",
+            "Attendance": attendance_label(b, e["id"]), "areas": mins,
+            "Time by line": " · ".join(f"{short(a)} {fmt_min(m)}" for a, m in mins.items() if m >= 1),
+            "Break": fmt_min(brk) if brk >= 1 else "", "Worked": fmt_min(sum(mins.values())),
         })
     return rows
-
-
-def on_group_break(f: dict, aid: str) -> bool:
-    return any(f["group_break"][g] and aid in grp["areas"] for g, grp in BREAK_GROUPS.items())
-
-
-def short_areas(f: dict) -> list[tuple[dict, int]]:
-    out = []
-    for a in f["areas"]:
-        if a["std"] is not None and a["id"] != "BRK" and not on_group_break(f, a["id"]):
-            n = len(crew(f, a["id"]))
-            if n < a["std"]:
-                out.append((a, n))
-    return out
-
-
-def moves_count(f: dict) -> int:
-    return sum(1 for ev in f["events"] if ev["kind"] in ("move", "late", "left"))
 
 
 # ================= login =================
@@ -428,169 +422,159 @@ def logout() -> None:
     st.session_state.pop(AUTH_KEY, None)
 
 
-def require_login(purpose: str) -> dict | None:
-    """Returns the logged-in user, or draws the PIN form and returns None."""
+def user_desc(u: dict) -> str:
+    if u["group"] is None:
+        return "Supervisor · both floors"
+    return f"{FLOORS[u['floor']]} · {LEAD_GROUPS[u['group']]['label']}"
+
+
+def require_login(purpose: str, supervisors_only: bool = False) -> dict | None:
     u = current_user()
     if u:
+        if supervisors_only and u["group"] is not None:
+            st.warning("Only supervisors can open this page.")
+            return None
         return u
     users = get_state()["users"]
-    st.markdown(f"### Sign in")
+    st.markdown("### Sign in")
     st.caption(f"Sign in to {purpose}. You stay signed in for {LOGIN_HOURS} hours on this device.")
     with st.form("fb_login", border=True):
         name = st.selectbox("Name", [x["name"] for x in users])
         pin = st.text_input("PIN", type="password", max_chars=6)
         if st.form_submit_button("Sign in", type="primary"):
-            match = next((x for x in users if x["name"] == name and x["pin"] == pin), None)
+            match = next((x for x in users if x["name"] == name and str(x["pin"]) == pin), None)
             if match:
                 st.session_state[AUTH_KEY] = {**match, "at": datetime.now(TZ)}
                 st.rerun()
             st.error("Wrong PIN.")
-    st.caption("Demo PINs: " + " · ".join(f"{x['name']} ({x['role']}, "
-                                         f"{FLOORS[x['floor']]['name'] if x['floor'] else 'both floors'}) {x['pin']}"
-                                         for x in users))
+    st.caption("Demo PINs: " + " · ".join(f"{x['name']} ({user_desc(x)}) {x['pin']}" for x in users))
     return None
-
-
-def _floor_for(u: dict, key: str) -> dict:
-    """Leads get their own floor; supervisors choose."""
-    g = get_state()
-    if u["floor"]:
-        return g["floors"][u["floor"]]
-    pick = st.segmented_control("Floor", list(FLOORS), format_func=lambda k: FLOORS[k]["name"],
-                                default="fill", key=f"floor_pick_{key}", required=True)
-    return g["floors"][pick or "fill"]
 
 
 # ================= screens =================
 
-ROLE_KEY = {"Operator": "op", "Assistant": "as", "Palletizer": "pa", "Kit line": "kt"}
-GRID_COLS = 7
-
 CSS = """
 <style>
-/* chips: one per employee, colored by role */
-[class*="st-key-chip-"] button {
-  border-radius: 999px; border: 0; min-height: 40px; padding: 2px 14px; font-weight: 700;
-}
-[class*="st-key-chip-op-"] button { background: #60A5FA; }
-[class*="st-key-chip-as-"] button { background: #FBBF24; }
-[class*="st-key-chip-pa-"] button { background: #2DD4BF; }
-[class*="st-key-chip-kt-"] button { background: #C4B5FD; }
-[class*="st-key-chip-"] button:hover { filter: brightness(1.1); }
-[class*="st-key-chip-"][class*="-sel-"] button { outline: 3px solid #FACC15; outline-offset: 2px; transform: scale(1.05); }
-[class*="st-key-chip-"][class*="-dim-"] button { opacity: .7; }
-
-/* buttons: dark text on yellow */
-button[kind="primary"], button[kind="primaryFormSubmit"] { background: #FACC15 !important; border-color: #FACC15 !important; }
-button[kind="primary"] p, button[kind="primaryFormSubmit"] p, [class*="st-key-chip-"] button p, [class*="st-key-zh-target-"] button p {
-  color: #0B1220 !important; font-weight: 700;
-}
-[class*="st-key-zh-target-"] button { min-height: 44px; border: 0; background: #FACC15; }
-
-/* area tiles */
-[class*="st-key-zone-"] { background: #131C2E; border-radius: 14px; }
-[class*="st-key-zone-short-"] { border: 1px solid #F87171 !important; }
-[class*="st-key-zone-target-"] { border: 1px solid #FACC15 !important; }
-[class*="st-key-zone-brk-"] { border: 1px dashed #475569 !important; background: #0F1626; }
-[class*="st-key-boxzone"] { background: #131C2E; border-radius: 14px; }
-.fb-zh { color:#E5ECF6; display:flex; justify-content:space-between; align-items:center; gap:6px; min-height:44px;
-  padding:0 10px; border-radius:10px; background:#1B2740; font-weight:700; font-size:14px; white-space:nowrap; }
-.fb-onbrk { color:#94A3B8; font-size:13px; font-weight:600; text-align:center; padding:4px 0; }
-.fb-zh span { color:#94A3B8; font-size:14px; }
-.fb-zh.short span { color:#FCA5A5; }
-.fb-zh.brk { background:#151E30; }
-.fb-boxtitle { color:#E5ECF6; font-weight:700; padding:4px 0; }
-.fb-boxtitle span { color:#94A3B8; font-weight:400; }
-
-/* pills and strips */
+button[kind="primary"], button[kind="primaryFormSubmit"] { background:#FACC15 !important; border-color:#FACC15 !important; }
+button[kind="primary"] p, button[kind="primaryFormSubmit"] p { color:#0B1220 !important; font-weight:700; }
 .fb-pill { color:#E5ECF6; display:inline-block; padding:6px 12px; border-radius:12px; background:#131C2E;
   border:1px solid #26344D; font-size:14px; margin:0 6px 6px 0; }
-.fb-live { display:inline-block; padding:3px 10px; border-radius:999px; background:#0F2A1E; color:#4ADE80;
+.fb-tag { display:inline-block; padding:3px 10px; border-radius:999px; background:#1B2740; color:#E5ECF6;
   font-size:12px; font-weight:700; letter-spacing:.06em; }
-.fb-floor { display:inline-block; padding:3px 10px; border-radius:999px; background:#1B2740; color:#E5ECF6;
-  font-size:12px; font-weight:700; letter-spacing:.06em; }
+.fb-live { background:#0F2A1E; color:#4ADE80; }
 .fb-due { display:inline-block; padding:8px 12px; border-radius:12px; font-weight:600; font-size:14px; }
-.fb-hint { padding:10px 14px; border-radius:12px; background:#FACC15; color:#0B1220; font-weight:600; }
 .fb-move { color:#E5ECF6; display:inline-block; padding:6px 10px; border-radius:10px; background:#1B2740;
   font-size:13px; margin:0 6px 6px 0; }
 .fb-move span { color:#94A3B8; margin-right:6px; }
-.fb-legend span { display:inline-flex; align-items:center; gap:5px; margin-right:12px; font-size:13px; color:#94A3B8; }
-.fb-legend i { width:10px; height:10px; border-radius:50%; display:inline-block; }
-
-/* read-only floor view */
 .fb-grid { display:grid; grid-template-columns:repeat(7, minmax(0,1fr)); gap:10px; align-items:start; }
 .fb-tile { background:#131C2E; border:1px solid #26344D; border-radius:14px; padding:6px;
-  display:flex; flex-direction:column; gap:6px; min-height:120px; }
+  display:flex; flex-direction:column; gap:6px; }
 .fb-tile.short { border-color:#F87171; }
 .fb-tile.brk { border-style:dashed; border-color:#475569; background:#0F1626; }
-.fb-name { border-radius:999px; padding:8px 10px; font-weight:700; font-size:14px; color:#0B1220; text-align:center; }
+.fb-zh { color:#E5ECF6; display:flex; justify-content:space-between; align-items:center; gap:6px; min-height:40px;
+  padding:0 10px; border-radius:10px; background:#1B2740; font-weight:700; font-size:14px; white-space:nowrap; }
+.fb-zh span { color:#94A3B8; }
+.fb-tile.short .fb-zh span { color:#FCA5A5; }
+.fb-onbrk { color:#94A3B8; font-size:13px; font-weight:600; text-align:center; padding:4px 0; }
+.fb-name { border-radius:999px; padding:7px 10px; font-weight:700; font-size:14px; color:#0B1220;
+  background:#60A5FA; text-align:center; }
 .fb-box { background:#131C2E; border:1px solid #26344D; border-radius:14px; padding:10px 12px; margin-bottom:10px;
-  display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  display:flex; flex-wrap:wrap; gap:6px; align-items:center; color:#E5ECF6; }
+.fb-box b { margin-right:6px; }
+.fb-box.absent .fb-name { background:#FCA5A5; }
 </style>
 """
 
+DRAG_CSS = """
+.sortable-component { display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:8px; align-items:start;
+  border:0; padding:0; background:transparent; }
+.sortable-container { background:#131C2E; border:1px solid #26344D; border-radius:12px; padding:6px; margin:0;
+  min-height:120px; counter-reset:none; }
+.sortable-container:nth-of-type(1) { grid-column:1 / -1; min-height:80px; }
+.sortable-container-header { color:#E5ECF6; font-weight:700; font-size:14px; padding:8px 10px; background:#1B2740;
+  border-radius:8px; margin-bottom:6px; }
+.sortable-container-body { display:flex; flex-wrap:wrap; gap:6px; background:transparent; min-height:60px; }
+.sortable-item { background:#60A5FA; color:#0B1220; border:0; border-radius:999px; padding:9px 14px; margin:0;
+  font-weight:700; font-size:14px; touch-action:none; }
+.sortable-item:hover { filter:brightness(1.1); }
+"""
 
-def _header(f: dict, title: str) -> None:
-    on_floor = sum(1 for e in f["employees"] if f["assign"][e["id"]] not in (BOX, "BRK"))
-    in_box = len(crew(f, BOX))
-    box_label = "Absent" if f["attendance_confirmed"] else "Not placed"
-    left, right = st.columns([3, 2], vertical_alignment="center")
-    left.markdown(
-        f"### {title} &nbsp;<span class='fb-floor'>{f['name'].upper()}</span> <span class='fb-live'>LIVE</span>\n"
-        f"{get_state()['shift']} · Floor lead: {f['lead']} · {fmt(now())}",
+
+def _slot_picker(key: str) -> tuple[date, str]:
+    """Day + shift selector, defaulting to the current shift."""
+    d0, s0 = current_slot()
+    c1, c2, _ = st.columns([1, 1, 3])
+    d = c1.date_input("Day", value=d0, key=f"day_{key}", format="MM/DD/YYYY")
+    s = c2.segmented_control("Shift", list(SHIFTS), default=s0, key=f"shift_{key}", required=True)
+    return d, s or s0
+
+
+def _floor_picker(key: str, default: str = "fill") -> str:
+    return st.segmented_control("Floor", list(FLOORS), format_func=FLOORS.get, default=default,
+                                key=f"floor_{key}", required=True) or default
+
+
+def _title(b: dict, title: str) -> None:
+    live = (b["date"], b["shift"]) == current_slot() and not b["ended"]
+    tags = f"<span class='fb-tag'>{FLOORS[b['floor']].upper()}</span> " \
+           f"<span class='fb-tag'>{b['shift'].upper()} SHIFT · {fmt_day(b['date']).upper()}</span> " + \
+           ("<span class='fb-tag fb-live'>LIVE</span>" if live else "")
+    st.markdown(f"### {title} &nbsp;{tags}", unsafe_allow_html=True)
+
+
+def _pills(b: dict) -> None:
+    on_line = sum(1 for e in b["employees"] if b["assign"][e["id"]] not in (BOX, "BRK"))
+    box_label = "Absent" if b["finalized"] else "Not placed"
+    st.markdown(
+        f"<span class='fb-pill'>On lines <b>{on_line}</b></span>"
+        f"<span class='fb-pill'>On break <b>{len(crew(b, 'BRK'))}</b></span>"
+        f"<span class='fb-pill'>{box_label} <b>{len(crew(b, BOX))}</b></span>"
+        f"<span class='fb-pill'>Crew <b>{len(b['employees'])}</b></span>",
         unsafe_allow_html=True,
     )
-    right.markdown(
-        f"<span class='fb-pill'>On floor <b>{on_floor}</b></span>"
-        f"<span class='fb-pill'>{box_label} <b>{in_box}</b></span>"
-        f"<span class='fb-pill'>On break <b>{len(crew(f, 'BRK'))}</b></span>"
-        f"<span class='fb-pill'>Moves <b>{moves_count(f)}</b></span>",
-        unsafe_allow_html=True,
-    )
 
 
-def _legend() -> None:
-    items = "".join(f'<span><i style="background:{c}"></i>{r}</span>' for r, c in ROLES.items())
-    st.markdown(f'<div class="fb-legend">{items}</div>', unsafe_allow_html=True)
-
-
-def _latest(f: dict, n: int = 5) -> None:
-    if f["events"]:
-        html = "".join(f"<span class='fb-move'><span>{fmt(ev['t'])}</span>{ev['text']}</span>" for ev in f["events"][:n])
+def _latest(b: dict, n: int = 5) -> None:
+    if b["events"]:
+        html = "".join(f"<span class='fb-move'><span>{fmt(ev['t'])}</span>{ev['text']}</span>" for ev in b["events"][:n])
         st.markdown("**Latest** &nbsp; " + html, unsafe_allow_html=True)
+
+
+def _read_only_board(b: dict, areas: list[dict]) -> None:
+    box = crew(b, BOX)
+    if box:
+        label = "Absent" if b["finalized"] else "Not placed yet"
+        cls = "absent" if b["finalized"] else ""
+        names = "".join(f"<span class='fb-name'>{e['name']}</span>" for e in box)
+        st.markdown(f"<div class='fb-box {cls}'><b>{label} · {len(box)}</b>{names}</div>", unsafe_allow_html=True)
+    tiles = []
+    for a in areas:
+        people = crew(b, a["id"])
+        brk = a["id"] == "BRK" or on_group_break(b, a["id"])
+        cls = "brk" if brk else ("short" if is_short(b, a["id"]) else "")
+        req = b["reqs"].get(a["id"])
+        count = str(len(people)) if a["id"] == "BRK" else ("" if brk else f"{len(people)}/{req}")
+        onbrk = "<div class='fb-onbrk'>On break</div>" if brk and a["id"] != "BRK" else ""
+        names = "".join(f"<div class='fb-name'>{e['name']}</div>" for e in people)
+        tiles.append(f"<div class='fb-tile {cls}'><div class='fb-zh'>{a['name']}<span>{count}</span></div>{onbrk}{names}</div>")
+    st.markdown(f"<div class='fb-grid'>{''.join(tiles)}</div>", unsafe_allow_html=True)
 
 
 # ---------- read-only floor views ----------
 
-def _view(floor_key: str) -> None:
+def _view(floor: str) -> None:
     st.markdown(CSS, unsafe_allow_html=True)
+    d, s = _slot_picker(f"view_{floor}")
 
     @st.fragment(run_every="10s")
     def _live() -> None:
-        f = get_state()["floors"][floor_key]
-        _header(f, "Floor view")
-        if not f["attendance_confirmed"]:
-            st.caption("Attendance not confirmed yet.")
-        _legend()
-        absent = crew(f, BOX)
-        if absent:
-            label = "Absent / off the floor" if f["attendance_confirmed"] else "Not placed yet"
-            names = "".join(f"<span class='fb-name' style='background:{ROLES[e['role']]}'>{e['name']}</span>" for e in absent)
-            st.markdown(f"<div class='fb-box'><span class='fb-boxtitle'>{label} <span>· {len(absent)}</span></span>{names}</div>",
-                        unsafe_allow_html=True)
-        tiles = []
-        for a in f["areas"]:
-            people = crew(f, a["id"])
-            n = len(people)
-            on_brk = on_group_break(f, a["id"])
-            short = a["std"] is not None and n < a["std"] and f["attendance_confirmed"] and not on_brk
-            cls = "brk" if a["id"] == "BRK" or on_brk else ("short" if short else "")
-            count = "" if on_brk else str(n) if a["std"] is None else f"{n}/{a['std']}"
-            names = "".join(f"<div class='fb-name' style='background:{ROLES[e['role']]}'>{e['name']}</div>" for e in people)
-            onbrk = "<div class='fb-onbrk'>On break</div>" if on_brk else ""
-            tiles.append(f"<div class='fb-tile {cls}'><div class='fb-zh {cls}'>{a['name']}<span>{count}</span></div>{onbrk}{names}</div>")
-        st.markdown(f"<div class='fb-grid'>{''.join(tiles)}</div>", unsafe_allow_html=True)
-        _latest(f)
+        b = get_board(d, s, floor)
+        _title(b, "Floor view")
+        _pills(b)
+        if not b["confirmed"]:
+            st.caption("No lead has confirmed attendance yet for this shift.")
+        _read_only_board(b, AREAS)
+        _latest(b)
 
     _live()
 
@@ -603,63 +587,55 @@ def view_pack() -> None:
     _view("pack")
 
 
-# ---------- update (sign-in, move people) ----------
-
-@st.dialog("Confirm attendance")
-def _attendance_dialog(f: dict, by: str) -> None:
-    absent = crew(f, BOX)
-    present = len(f["employees"]) - len(absent)
-    st.write(f"**{present} present** (on a line) · **{len(absent)} absent** (still in the box)")
-    if absent:
-        st.caption("Will be marked absent: " + ", ".join(e["name"] for e in absent))
-    st.caption("Line time starts now. Anyone placed later from the box is recorded as late.")
-    c1, c2 = st.columns(2)
-    if c1.button("Confirm", type="primary", width="stretch"):
-        confirm_attendance(f, by)
-        st.rerun()
-    if c2.button("Go back", width="stretch"):
-        st.rerun()
-
+# ---------- update (sign-in, drag people) ----------
 
 @st.dialog("End shift")
-def _end_dialog(f: dict, by: str) -> None:
-    st.write(f"This closes everyone's time on the {f['name']} floor at {fmt(now())} and locks the board.")
+def _end_dialog(b: dict, by: str) -> None:
+    st.write(f"This closes everyone's time on the {FLOORS[b['floor']]} floor ({b['shift']} shift) at {fmt(now())} "
+             "and locks the board for both leads.")
     c1, c2 = st.columns(2)
     if c1.button("End shift", type="primary", width="stretch"):
-        end_shift(f, by)
+        end_shift(b, by)
         st.rerun()
     if c2.button("Cancel", width="stretch"):
         st.rerun()
 
 
-def _chip(f: dict, e: dict, where: str) -> None:
-    sel = f["selected"]
-    state = "sel" if sel == e["id"] else ("dim" if sel else "n")
-    st.button(
-        e["name"], key=f"chip-{ROLE_KEY[e['role']]}-{state}-{where}-{e['id']}",
-        on_click=select, args=(f, e["id"]), help=f"{e['name']} · {e['role']}",
-        disabled=f["ended"], width="stretch" if where == "tile" else "content",
-    )
+def _drag_board(b: dict, areas: list[dict], by: str) -> None:
+    """Box + the lead's lines + Break as drag-and-drop containers."""
+    labels: dict[str, str] = {}
+    used: dict[str, int] = {}
+    for e in b["employees"]:
+        n = used.get(e["name"], 0) + 1
+        used[e["name"]] = n
+        labels[e["id"]] = e["name"] if n == 1 else f"{e['name']} ({n})"
+    by_label = {v: k for k, v in labels.items()}
 
-
-def _tile(f: dict, a: dict) -> None:
-    people = crew(f, a["id"])
-    n = len(people)
-    sel = f["selected"]
-    is_target = bool(sel) and f["assign"][sel] != a["id"]
-    on_brk = on_group_break(f, a["id"])
-    is_short = a["std"] is not None and n < a["std"] and f["attendance_confirmed"] and not on_brk
-    state = "target" if is_target else "brk" if a["id"] == "BRK" or on_brk else "short" if is_short else "ok"
-    count = "" if on_brk else str(n) if a["std"] is None else f"{n}/{a['std']}"
-    with st.container(border=True, key=f"zone-{state}-{f['key']}-{a['id']}"):
-        if is_target:
-            st.button(f"Move to {a['short']}", key=f"zh-target-{f['key']}-{a['id']}", on_click=move_selected,
-                      args=(f, a["id"]), width="stretch", help=f"Move to {a['name']}")
+    containers = [(BOX, f"{'Absent' if b['finalized'] else 'Not placed yet'} · {len(crew(b, BOX))}  —  "
+                        "press and hold a name, then drag it to a line")]
+    extra_css = []
+    for i, a in enumerate(areas, start=2):  # nth-of-type: the box is 1
+        n = len(crew(b, a["id"]))
+        if a["id"] == "BRK":
+            head = f"Break · {n}"
+            extra_css.append(f".sortable-container:nth-of-type({i}){{border-style:dashed;border-color:#475569;background:#0F1626}}")
+        elif on_group_break(b, a["id"]):
+            head = f"{a['name']} · on break"
+            extra_css.append(f".sortable-container:nth-of-type({i}){{border-style:dashed;border-color:#475569}}")
         else:
-            st.markdown(f"<div class='fb-zh {state}'>{a['name']}<span>{count}</span></div>"
-                        + ("<div class='fb-onbrk'>On break</div>" if on_brk else ""), unsafe_allow_html=True)
-        for e in people:
-            _chip(f, e, "tile")
+            head = f"{a['name']} · {n}/{b['reqs'].get(a['id'], 0)}"
+            if is_short(b, a["id"]):
+                extra_css.append(f".sortable-container:nth-of-type({i}){{border-color:#F87171}}"
+                                 f".sortable-container:nth-of-type({i}) .sortable-container-header{{color:#FCA5A5}}")
+        containers.append((a["id"], head))
+
+    items = [{"header": head, "items": [labels[e["id"]] for e in crew(b, aid)]} for aid, head in containers]
+    result = sort_items(items, multi_containers=True, direction="horizontal",
+                        custom_style=DRAG_CSS + "".join(extra_css),
+                        key=f"drag-{board_key(b['date'], b['shift'], b['floor'])}-{b['rev']}-{len(areas)}")
+    layout = {aid: [by_label[x] for x in c["items"] if x in by_label] for (aid, _), c in zip(containers, result)}
+    if apply_layout(b, layout, by):
+        st.rerun()
 
 
 def update_page() -> None:
@@ -667,65 +643,64 @@ def update_page() -> None:
     u = require_login("update the floor")
     if not u:
         return
-    f = _floor_for(u, "update")
     by = u["name"]
-    _header(f, "Floor Board")
-    in_box = len(crew(f, BOX))
-
-    if f["ended"]:
-        st.success(f"Shift ended at {fmt(f['end_time'])}. See End of shift for the totals.")
-    elif not f["attendance_confirmed"]:
-        st.info("**Start of shift:** tap a name, then tap the line they're working. When everyone who's here is "
-                "placed, confirm attendance. Anyone left in the box is marked absent.")
-        a, b, c = st.columns([1, 1, 2])
-        a.button("Load usual layout", on_click=load_usual_layout, args=(f,), width="stretch")
-        b.button("Clear board", on_click=clear_board, args=(f,), width="stretch")
-        present = len(f["employees"]) - in_box
-        if c.button(f"Confirm attendance · {present} present · {in_box} absent", type="primary", width="stretch"):
-            _attendance_dialog(f, by)
+    if u["group"] is None:  # supervisor: any floor / day / shift, all lines
+        floor = _floor_picker("update")
+        d, s = _slot_picker("update")
+        groups = list(LEAD_GROUPS)
     else:
-        left = check_minutes_left(f)
-        pill = (f"<span class='fb-due' style='background:#2A2111;color:#FBBF24'>Board check due in {left} min</span>"
-                if left >= 0 else
-                f"<span class='fb-due' style='background:#2A1517;color:#FCA5A5'>Board check overdue by {-left} min</span>")
-        a, d, e_ = st.columns([3, 2, 1], vertical_alignment="center")
-        a.markdown(pill, unsafe_allow_html=True)
-        d.button("Board is correct", type="primary", on_click=confirm_board, args=(f, by), width="stretch")
-        if e_.button("End shift", width="stretch"):
-            _end_dialog(f, by)
-        for col, g in zip(st.columns(2), BREAK_GROUPS):
-            grp = BREAK_GROUPS[g]
-            label = (f"Bring {grp['label']} back from break" if f["group_break"][g]
-                     else f"Send {grp['label']} to break")
-            col.button(label, key=f"grpbrk-{f['key']}-{g}", on_click=toggle_group_break, args=(f, g), width="stretch")
+        floor = u["floor"]
+        d, s = current_slot()
+        groups = [u["group"]]
+    b = get_board(d, s, floor)
+    areas = [AREA_BY_ID[a] for g in groups for a in LEAD_GROUPS[g]["areas"]] + [BREAK]
 
-    if f["selected"]:
-        e = emp(f, f["selected"])
-        h1, h2 = st.columns([5, 1], vertical_alignment="center")
-        h1.markdown(f"<div class='fb-hint'>Moving {e['name']} — tap <b>Move to …</b> on the area they're going to.</div>",
-                    unsafe_allow_html=True)
-        h2.button("Cancel", on_click=cancel_selection, args=(f,), width="stretch")
-    else:
-        _legend()
+    _title(b, "Floor Board")
+    st.caption(f"Signed in as {by} · {user_desc(u)} · {fmt(now())}")
+    _pills(b)
 
-    sel = f["selected"]
-    with st.container(border=True, key=f"boxzone-{f['key']}"):
-        title = "Absent / off the floor" if f["attendance_confirmed"] else "Not placed yet"
-        if sel and f["assign"][sel] is not BOX:
-            label = "Move here · left the floor" if f["attendance_confirmed"] else "Move here · back to the box"
-            st.button(label, key=f"zh-target-{f['key']}-BOX", on_click=move_selected, args=(f, BOX), width="stretch")
+    if b["ended"]:
+        st.success(f"Shift ended at {fmt(b['ended']['t'])} by {b['ended']['by']}. See End of shift for the totals.")
+        _read_only_board(b, areas)
+        return
+
+    # attendance status for every lead on this floor
+    status = []
+    for g, grp in LEAD_GROUPS.items():
+        c = b["confirmed"].get(g)
+        status.append(f"{grp['label']}: " + (f"confirmed by {c['by']} at {fmt(c['t'])}" if c else "waiting"))
+    st.caption("Attendance · " + " · ".join(status)
+               + (" · **final**" if b["finalized"] else " · people left in the box become absent once every lead confirms"))
+
+    for g in groups:
+        grp = LEAD_GROUPS[g]
+        if g not in b["confirmed"]:
+            placed = sum(1 for e in b["employees"] if b["assign"][e["id"]] in grp["areas"])
+            c1, c2 = st.columns([1, 2])
+            c1.button(f"Load usual layout · {grp['label']}", key=f"usual-{g}", width="stretch",
+                      on_click=load_usual_layout, args=(b, g, by))
+            c2.button(f"Confirm attendance · {grp['label']} · {placed} on lines", key=f"conf-{g}", type="primary",
+                      width="stretch", on_click=confirm_group, args=(b, g, by))
         else:
-            st.markdown(f"<div class='fb-boxtitle'>{title} <span>· {in_box}</span></div>", unsafe_allow_html=True)
-        with st.container(horizontal=True, wrap=True, gap="small"):
-            for e in crew(f, BOX):
-                _chip(f, e, "box")
+            left = check_minutes_left(b, g)
+            pill = (f"<span class='fb-due' style='background:#2A2111;color:#FBBF24'>{grp['label']}: board check due in {left} min</span>"
+                    if left >= 0 else
+                    f"<span class='fb-due' style='background:#2A1517;color:#FCA5A5'>{grp['label']}: board check overdue by {-left} min</span>")
+            bg = BREAK_GROUPS[g]
+            brk_label = (f"Bring {bg['label']} back from break" if b["group_break"][g] else f"Send {bg['label']} to break")
+            c1, c2, c3 = st.columns([2, 2, 1], vertical_alignment="center")
+            c1.markdown(pill, unsafe_allow_html=True)
+            c2.button(brk_label, key=f"brk-{g}", width="stretch", on_click=toggle_group_break, args=(b, g, by))
+            c3.button("Board is correct", key=f"chk-{g}", type="primary", width="stretch",
+                      on_click=confirm_board, args=(b, g, by))
 
-    areas = f["areas"]
-    for i in range(0, len(areas), GRID_COLS):
-        for col, a in zip(st.columns(GRID_COLS, gap="small"), areas[i:i + GRID_COLS]):
-            with col:
-                _tile(f, a)
-    _latest(f)
+    _drag_board(b, areas, by)
+
+    c1, c2 = st.columns([4, 1], vertical_alignment="center")
+    with c1:
+        _latest(b)
+    if b["confirmed"] and c2.button("End shift", width="stretch"):
+        _end_dialog(b, by)
 
 
 # ---------- supervisor view (sign-in) ----------
@@ -735,48 +710,54 @@ def supervisor_page() -> None:
     u = require_login("see the supervisor view")
     if not u:
         return
-    f = _floor_for(u, "supervisor")
-    st.markdown(f"### Live floor &nbsp;<span class='fb-floor'>{f['name'].upper()}</span> <span class='fb-live'>LIVE</span>",
-                unsafe_allow_html=True)
-    st.caption(f"{get_state()['shift']} · lead {f['lead']} · as of {fmt(now())}")
+    floor = _floor_picker("sup", default=u["floor"] or "fill")
+    d, s = _slot_picker("sup")
+    b = get_board(d, s, floor)
+    _title(b, "Supervisor view")
 
-    att = f["attendance"]
-    ok = f["attendance_confirmed"]
-    short = short_areas(f) if ok else []
+    absent = absent_list(b)
+    late = [e for e in b["employees"] if b["attendance"].get(e["id"], {}).get("status") == "Late"]
+    shorts = [a for a in LINES if is_short(b, a["id"])]
     m = st.columns(5)
-    m[0].metric("On the floor", sum(1 for e in f["employees"] if f["assign"][e["id"]] not in (BOX, "BRK")),
-                help=f"{len(crew(f, 'BRK'))} on break")
-    m[1].metric("Absent", sum(1 for v in att.values() if v["status"] == "Absent") if ok else "—")
-    m[2].metric("Late", sum(1 for v in att.values() if v["status"] == "Late") if ok else "—")
-    m[3].metric("Areas short", len(short) if ok else "—")
-    m[4].metric("Moves", moves_count(f))
+    m[0].metric("On lines", sum(1 for e in b["employees"] if b["assign"][e["id"]] not in (BOX, "BRK")))
+    m[1].metric("On break", len(crew(b, "BRK")))
+    m[2].metric("Absent", len(absent) if b["finalized"] else "—")
+    m[3].metric("Late", len(late))
+    m[4].metric("Lines short", len(shorts))
 
-    if not ok:
-        st.info("Attendance not confirmed yet. Line time starts when the floor lead confirms.")
-    else:
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown("**Absent**")
+        if not b["finalized"]:
+            waiting = [grp["label"] for g, grp in LEAD_GROUPS.items() if g not in b["confirmed"]]
+            st.caption("Not final yet · waiting on " + ", ".join(waiting))
+        if absent:
+            st.dataframe(pd.DataFrame([{"Employee": e["name"], "Usual line": AREA_BY_ID[e["home"]]["name"]}
+                                       for e in absent]), hide_index=True, width="stretch")
+        elif b["finalized"]:
+            st.success("No one absent.")
+        if late:
+            st.markdown("**Late**")
+            st.dataframe(pd.DataFrame([{"Employee": e["name"], "Arrived": fmt(b["attendance"][e["id"]]["time"])}
+                                       for e in late]), hide_index=True, width="stretch")
+    with right:
         st.markdown("**Needs attention**")
-        left = check_minutes_left(f)
         alerts = 0
-        if left < 0 and not f["ended"]:
-            st.warning(f"Board check overdue by {-left} min ({f['lead']})")
-            alerts += 1
-        for a, n in short:
-            st.error(f"{a['name']}: {n} of {a['std']}")
+        if not b["ended"]:
+            for g, grp in LEAD_GROUPS.items():
+                if g in b["confirmed"] and check_minutes_left(b, g) < 0:
+                    st.warning(f"{grp['label']}: board check overdue by {-check_minutes_left(b, g)} min")
+                    alerts += 1
+        for a in shorts:
+            st.error(f"{a['name']}: {len(crew(b, a['id']))} of {b['reqs'][a['id']]}")
             alerts += 1
         if not alerts:
-            st.success("All areas staffed and the board is up to date.")
+            st.success("All lines staffed and boards up to date.")
 
     st.markdown("**Crews**")
-    rows = [{"Area": a["name"], "Crew": ", ".join(e["name"] for e in crew(f, a["id"])),
-             "On crew": len(crew(f, a["id"])), "Minimum": a["std"]} for a in f["areas"]]
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=420)
-
-    st.markdown("**Latest moves**")
-    if f["events"]:
-        st.dataframe(pd.DataFrame([{"Time": fmt(ev["t"]), "What": ev["text"]} for ev in f["events"][:10]]),
-                     hide_index=True, width="stretch")
-    else:
-        st.caption("No moves yet.")
+    st.dataframe(pd.DataFrame([{"Line": a["name"], "Crew": ", ".join(e["name"] for e in crew(b, a["id"])),
+                                "On line": len(crew(b, a["id"])), "Required": b["reqs"].get(a["id"])}
+                               for a in AREAS]), hide_index=True, width="stretch", height=420)
 
 
 # ---------- end of shift (sign-in) ----------
@@ -786,104 +767,162 @@ def summary_page() -> None:
     u = require_login("see the end of shift report")
     if not u:
         return
-    f = _floor_for(u, "summary")
-    st.markdown(f"### End of shift · time by area &nbsp;<span class='fb-floor'>{f['name'].upper()}</span>",
-                unsafe_allow_html=True)
-    if not f["attendance_confirmed"]:
-        st.info("Nothing recorded yet. Time starts when attendance is confirmed on the Update page.")
+    floor = _floor_picker("eos", default=u["floor"] or "fill")
+    d, s = _slot_picker("eos")
+    b = get_board(d, s, floor)
+    _title(b, "End of shift")
+    if not b["confirmed"]:
+        st.info("Nothing recorded for this shift yet.")
         return
-    if f["ended"]:
-        st.caption(f"{get_state()['shift']} · {fmt(f['attendance_time'])} – {fmt(f['end_time'])} · built from the board moves")
+    if b["ended"]:
+        st.caption(f"Ended {fmt(b['ended']['t'])} by {b['ended']['by']} · built from the board moves")
     else:
-        st.caption(f"Shift in progress · totals as of {fmt(now())} · the floor lead ends the shift on the Update page")
+        st.caption(f"Shift in progress · totals as of {fmt(now())} · a lead ends the shift on the Update page")
 
-    rows = summary_rows(f)
-    st.dataframe(pd.DataFrame(rows)[["Employee", "Role", "Attendance", "Time by area", "Break", "Worked"]],
+    absent = absent_list(b)
+    st.markdown(f"**Absent · {len(absent)}**" if b["finalized"] else "**Absent** · not final yet")
+    if absent:
+        st.dataframe(pd.DataFrame([{"Employee": e["name"], "Usual line": AREA_BY_ID[e["home"]]["name"]} for e in absent]),
+                     hide_index=True, width="stretch")
+
+    rows = summary_rows(b)
+    st.markdown("**Time by line**")
+    st.dataframe(pd.DataFrame(rows)[["Employee", "Usual line", "Attendance", "Time by line", "Break", "Worked"]],
                  hide_index=True, width="stretch", height=460)
 
-    long_rows = [{"Floor": f["name"], "Employee": r["Employee"], "Role": r["Role"],
-                  "Area": area(f, a)["name"], "Minutes": round(mins)}
-                 for r in rows for a, mins in r["areas"].items()]
-    att_rows = [{"Floor": f["name"], "Employee": r["Employee"], "Role": r["Role"], "Attendance": r["Attendance"]}
-                for r in rows]
-    log_rows = [{"Time": fmt(ev["t"]), "Event": ev["text"]} for ev in reversed(f["events"])]
-    k = f["name"].lower()
-    d1, d2, d3 = st.columns(3)
-    d1.download_button("Minutes by area (CSV)", pd.DataFrame(long_rows).to_csv(index=False),
-                       f"{k}_minutes_by_area.csv", "text/csv", width="stretch")
-    d2.download_button("Attendance (CSV)", pd.DataFrame(att_rows).to_csv(index=False),
-                       f"{k}_attendance.csv", "text/csv", width="stretch")
-    d3.download_button("Move log (CSV)", pd.DataFrame(log_rows).to_csv(index=False),
-                       f"{k}_move_log.csv", "text/csv", width="stretch")
+    tag = f"{FLOORS[floor].lower()}_{d.isoformat()}_{s}"
+    long_rows = [{"Date": d.isoformat(), "Shift": s, "Floor": FLOORS[floor], "Employee": r["Employee"],
+                  "Line": AREA_BY_ID[a]["name"], "Minutes": round(m)} for r in rows for a, m in r["areas"].items()]
+    att_rows = [{"Date": d.isoformat(), "Shift": s, "Floor": FLOORS[floor], "Employee": r["Employee"],
+                 "Attendance": r["Attendance"]} for r in rows]
+    log_rows = [{"Time": fmt(ev["t"]), "Event": ev["text"]} for ev in reversed(b["events"])]
+    c1, c2, c3 = st.columns(3)
+    c1.download_button("Minutes by line (CSV)", pd.DataFrame(long_rows).to_csv(index=False),
+                       f"{tag}_minutes_by_line.csv", "text/csv", width="stretch")
+    c2.download_button("Attendance (CSV)", pd.DataFrame(att_rows).to_csv(index=False),
+                       f"{tag}_attendance.csv", "text/csv", width="stretch")
+    c3.download_button("Move log (CSV)", pd.DataFrame(log_rows).to_csv(index=False),
+                       f"{tag}_move_log.csv", "text/csv", width="stretch")
     st.markdown("**Move log**")
     st.dataframe(pd.DataFrame(log_rows), hide_index=True, width="stretch")
 
 
-# ---------- setup (sign-in) ----------
+# ---------- setup (supervisors) ----------
+
+def _template_xlsx() -> bytes:
+    g = get_state()
+    crew_df = pd.DataFrame([{"Floor": FLOORS[r["floor"]], "Shift": r["shift"], "Name": r["name"],
+                             "Usual line": AREA_BY_ID[r["line"]]["name"]} for r in g["roster"]])
+    lines_df = pd.DataFrame([{"Floor": FLOORS[f], "Shift": s, "Line": AREA_BY_ID[l]["name"], "Required": n}
+                             for (f, s, l), n in g["reqs"].items()])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        crew_df.to_excel(xw, sheet_name="Crew", index=False)
+        lines_df.to_excel(xw, sheet_name="Lines", index=False)
+    return buf.getvalue()
+
+
+def _norm_floor(v) -> str | None:
+    v = str(v).strip().lower()
+    return next((k for k, name in FLOORS.items() if v in (k, name.lower())), None)
+
+
+def _norm_shift(v) -> str | None:
+    v = str(v).strip().lower().replace("shift", "").strip()
+    return {"1": "1st", "1st": "1st", "first": "1st", "2": "2nd", "2nd": "2nd", "second": "2nd"}.get(v)
+
+
+def _norm_line(v) -> str | None:
+    v = str(v).strip().lower().replace("line", "").strip()
+    if v in ("kit", "kit line", "k"):
+        return "KIT"
+    v = v.lstrip("l").strip()
+    return f"L{int(float(v))}" if v.replace(".", "", 1).isdigit() and 1 <= int(float(v)) <= 18 else None
+
+
+def _import_xlsx(data) -> tuple[list[dict], dict, list[str]]:
+    sheets = pd.read_excel(data, sheet_name=None)
+    errors, roster, reqs = [], [], {}
+    crew_df, lines_df = sheets.get("Crew"), sheets.get("Lines")
+    if crew_df is None or lines_df is None:
+        return [], {}, ["The file needs two sheets named Crew and Lines (download the template)."]
+    for i, r in crew_df.iterrows():
+        f, s, l = _norm_floor(r.get("Floor")), _norm_shift(r.get("Shift")), _norm_line(r.get("Usual line"))
+        name = str(r.get("Name", "")).strip()
+        if not name or name == "nan":
+            continue
+        if not (f and s and l):
+            errors.append(f"Crew row {i + 2}: check Floor / Shift / Usual line for {name}")
+            continue
+        roster.append({"floor": f, "shift": s, "name": name, "line": l})
+    for i, r in lines_df.iterrows():
+        f, s, l = _norm_floor(r.get("Floor")), _norm_shift(r.get("Shift")), _norm_line(r.get("Line"))
+        if not (f and s and l) or pd.isna(r.get("Required")):
+            errors.append(f"Lines row {i + 2}: check Floor / Shift / Line / Required")
+            continue
+        reqs[(f, s, l)] = int(r["Required"])
+    return roster, reqs, errors
+
 
 def setup_page() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
-    u = require_login("change the setup")
+    u = require_login("change the setup", supervisors_only=True)
     if not u:
         return
     g = get_state()
-    f = _floor_for(u, "setup")
-    st.markdown(f"### Setup &nbsp;<span class='fb-floor'>{f['name'].upper()}</span>", unsafe_allow_html=True)
-    locked = f["attendance_confirmed"]
+    st.markdown("### Setup")
 
-    c1, c2 = st.columns(2)
-    f["lead"] = c1.text_input("Floor lead", f["lead"], key=f"lead_{f['key']}")
-    g["shift"] = c2.selectbox("Shift (both floors)", list(SHIFTS), index=list(SHIFTS).index(g["shift"]),
-                              disabled=any(x["attendance_confirmed"] for x in g["floors"].values()))
+    st.markdown("**Crew sheets, line requirements and usual layout**")
+    st.caption("One Excel file, two sheets. **Crew:** Floor, Shift, Name, Usual line. **Lines:** Floor, Shift, Line, "
+               "Required. Floor = Fill or Pack · Shift = 1st or 2nd · Line = Kit Line or Line 1–18.")
+    c1, c2 = st.columns([1, 2])
+    c1.download_button("Download template (current data)", _template_xlsx(), "floor_board_setup.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+    up = c2.file_uploader("Upload crew sheet", type=["xlsx"], label_visibility="collapsed")
+    if up is not None and st.button("Load this file", type="primary"):
+        roster, reqs, errors = _import_xlsx(up)
+        if roster:
+            g["roster"], g["reqs"] = roster, {**{k: 0 for k in g["reqs"]}, **reqs}
+            rebuilt = [k for k, bd in g["boards"].items() if not bd["confirmed"]]
+            for k in rebuilt:
+                del g["boards"][k]
+            st.success(f"Loaded {len(roster)} people and {len(reqs)} line requirements. "
+                       "Shifts already started keep their crew; new shifts use this file.")
+        for e in errors[:15]:
+            st.warning(e)
 
-    st.markdown("**Minimum staff by area**")
-    area_df = pd.DataFrame([{"Area": a["name"], "Minimum staff": a["std"]} for a in f["areas"] if a["id"] != "BRK"])
-    edited = st.data_editor(area_df, hide_index=True, disabled=["Area"], key=f"areas_editor_{f['key']}", width="stretch",
-                            column_config={"Minimum staff": st.column_config.NumberColumn(min_value=0, step=1)})
-    for a, std in zip([a for a in f["areas"] if a["id"] != "BRK"], edited["Minimum staff"]):
-        a["std"] = None if pd.isna(std) else int(std)
+    counts = pd.DataFrame(g["roster"]).groupby(["floor", "shift"]).size()
+    st.caption("Current crews: " + " · ".join(f"{FLOORS[f]} {s}: {n}" for (f, s), n in counts.items()))
 
-    st.markdown("**Roster**")
-    if locked:
-        st.caption("Roster is locked after attendance is confirmed. Reset the demo to edit it.")
-    names = {a["id"]: a["name"] for a in f["areas"]}
-    ids = {v: k for k, v in names.items()}
-    roster = st.data_editor(
-        pd.DataFrame([{"Name": e["name"], "Role": e["role"], "Usual area": names.get(e["home"], "")}
-                      for e in f["employees"]]),
-        hide_index=True, num_rows="fixed" if locked else "dynamic", disabled=locked,
-        key=f"roster_editor_{f['key']}", width="stretch",
-        column_config={"Role": st.column_config.SelectboxColumn(options=list(ROLES), required=True),
-                       "Usual area": st.column_config.SelectboxColumn(options=list(names.values()))},
+    st.markdown("**Logins**")
+    group_names = {**{k: v["label"] for k, v in LEAD_GROUPS.items()}, "": "Supervisor (all)"}
+    users = st.data_editor(
+        pd.DataFrame([{"Name": x["name"], "PIN": str(x["pin"]),
+                       "Floor": FLOORS[x["floor"]] if x["floor"] else "Both",
+                       "Lines": group_names[x["group"] or ""]} for x in g["users"]]),
+        hide_index=True, num_rows="dynamic", key="users_editor", width="stretch",
+        column_config={"Floor": st.column_config.SelectboxColumn(options=["Fill", "Pack", "Both"], required=True),
+                       "Lines": st.column_config.SelectboxColumn(options=list(group_names.values()), required=True)},
     )
-    if not locked and st.button("Save roster"):
-        new = [{"id": f"{f['key'][0].upper()}{i + 1:03d}", "name": r["Name"].strip(),
-                "role": r["Role"] if r["Role"] in ROLES else "Operator", "home": ids.get(r["Usual area"], "L1")}
-               for i, r in roster.iterrows() if isinstance(r["Name"], str) and r["Name"].strip()]
-        f.update(employees=new, assign={e["id"]: BOX for e in new}, selected=None)
-        st.success(f"Roster saved: {len(new)} employees, all back in the box.")
-
-    if u["role"] == "Supervisor":
-        st.markdown("**Logins (demo)**")
-        users = st.data_editor(
-            pd.DataFrame([{"Name": x["name"], "PIN": x["pin"], "Role": x["role"],
-                           "Floor": FLOORS[x["floor"]]["name"] if x["floor"] else "Both"} for x in g["users"]]),
-            hide_index=True, num_rows="dynamic", key="users_editor", width="stretch",
-            column_config={"Role": st.column_config.SelectboxColumn(options=["Lead", "Supervisor"], required=True),
-                           "Floor": st.column_config.SelectboxColumn(options=["Fill", "Pack", "Both"], required=True)},
-        )
-        if st.button("Save logins"):
-            back = {"Fill": "fill", "Pack": "pack", "Both": None}
-            g["users"] = [{"name": r["Name"], "pin": str(r["PIN"]), "role": r["Role"], "floor": back.get(r["Floor"])}
-                          for _, r in users.iterrows() if isinstance(r["Name"], str) and r["Name"].strip()]
-            st.success("Logins saved.")
+    if st.button("Save logins"):
+        floor_back = {"Fill": "fill", "Pack": "pack", "Both": None}
+        group_back = {v: (k or None) for k, v in group_names.items()}
+        new = []
+        for _, r in users.iterrows():
+            if isinstance(r["Name"], str) and r["Name"].strip():
+                grp = group_back.get(r["Lines"])
+                new.append({"name": r["Name"].strip(), "pin": str(r["PIN"]),
+                            "floor": None if grp is None else floor_back.get(r["Floor"]) or "fill", "group": grp})
+        g["users"] = new
+        st.success("Logins saved.")
 
     st.divider()
     st.markdown("**Demo**")
     g["clock_mode"] = st.radio("Clock", ["demo", "real"], index=["demo", "real"].index(g["clock_mode"]), horizontal=True,
                                format_func=lambda v: "Demo clock (sidebar buttons)" if v == "demo" else "Real time")
-    if st.button("Reset demo (both floors)"):
+    if st.button("Reset demo"):
         reset()
+        logout()
         st.rerun()
 
 
@@ -891,21 +930,20 @@ def setup_page() -> None:
 
 def _sidebar() -> None:
     g = get_state()
+    d, s = current_slot()
     with st.sidebar:
         st.markdown("**Floor Board demo**")
         st.caption("Memory only: refreshing the page resets the demo.")
+        st.markdown(f"Now: **{fmt_day(d)} · {s} shift · {fmt(now())}**")
         if g["clock_mode"] == "demo":
-            st.markdown(f"Demo clock: **{fmt(now())}**")
-            b1, b2 = st.columns(2)
+            b1, b2, b3 = st.columns(3)
             b1.button("+15 min", on_click=advance_clock, args=(15,), width="stretch")
-            b2.button("+1 hour", on_click=advance_clock, args=(60,), width="stretch")
-        else:
-            st.markdown(f"Clock: **{fmt(now())}** (real time)")
+            b2.button("+1 h", on_click=advance_clock, args=(60,), width="stretch")
+            b3.button("Next shift", on_click=jump_to_next_shift, width="stretch")
         u = current_user()
         if u:
             st.divider()
-            where = FLOORS[u["floor"]]["name"] if u["floor"] else "both floors"
-            st.markdown(f"Signed in: **{u['name']}** · {u['role']}, {where}")
+            st.markdown(f"Signed in: **{u['name']}**  \n{user_desc(u)}")
             st.button("Sign out", on_click=logout, width="stretch")
 
 
