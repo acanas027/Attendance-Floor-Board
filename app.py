@@ -32,21 +32,40 @@ TZ = ZoneInfo("America/Chicago")
 FLOORS = {"fill": "Fill", "pack": "Pack"}
 SHIFTS = {"1st": time(6, 0), "2nd": time(16, 0)}  # 1st 6 AM–4 PM; 2nd 4 PM–end of night (2–3 AM), dated by its start day
 
-LINES = [{"id": "KIT", "name": "Kit Line", "short": "Kit"}] + \
-        [{"id": f"L{n}", "name": f"Line {n}", "short": f"L{n}"} for n in range(1, 19)]
+ALL_LINES = [{"id": "KIT", "name": "Kit Line", "short": "Kit"}] + \
+            [{"id": f"L{n}", "name": f"Line {n}", "short": f"L{n}"} for n in range(1, 19)]
 BREAK = {"id": "BRK", "name": "Break", "short": "Break"}
-AREAS = LINES + [BREAK]
+AREAS = ALL_LINES + [BREAK]
 
-# Each lead owns one group of lines on their floor.
-LEAD_GROUPS = {
-    "A": {"label": "Kit Line – 9", "areas": ["KIT"] + [f"L{n}" for n in range(1, 10)]},
-    "B": {"label": "Lines 10 – 18", "areas": [f"L{n}" for n in range(10, 19)]},
+# Lines on each floor (Fill has no Kit Line).
+FLOOR_LINE_IDS = {
+    "fill": [f"L{n}" for n in range(1, 19)],
+    "pack": ["KIT"] + [f"L{n}" for n in range(1, 19)],
 }
-# The two break buttons.
-BREAK_GROUPS = {
-    "A": {"label": "lines Kit Line – 9", "areas": ["KIT"] + [f"L{n}" for n in range(1, 10)]},
-    "B": {"label": "lines 10 – 17", "areas": [f"L{n}" for n in range(10, 18)]},
-}
+GROUP_KEYS = ("A", "B")
+
+
+def floor_lines(floor: str) -> list[dict]:
+    return [AREA_BY_ID[i] for i in FLOOR_LINE_IDS[floor]]
+
+
+def floor_areas(floor: str) -> list[dict]:
+    return floor_lines(floor) + [BREAK]
+
+
+def lead_groups(floor: str) -> dict:
+    """Each lead owns one group of lines on their floor: (Kit Line) 1–9 and 10–18."""
+    ids = FLOOR_LINE_IDS[floor]
+    a = [i for i in ["KIT"] + [f"L{n}" for n in range(1, 10)] if i in ids]
+    return {"A": {"label": "Kit Line – 9" if "KIT" in ids else "Lines 1 – 9", "areas": a},
+            "B": {"label": "Lines 10 – 18", "areas": [f"L{n}" for n in range(10, 19)]}}
+
+
+def break_groups(floor: str) -> dict:
+    """The two break buttons: (Kit Line) 1–9 and 10–17."""
+    a = lead_groups(floor)["A"]
+    return {"A": {"label": "lines " + a["label"].replace("Lines ", ""), "areas": a["areas"]},
+            "B": {"label": "lines 10 – 17", "areas": [f"L{n}" for n in range(10, 18)]}}
 
 DATA_FILE = Path(__file__).with_name("floor_board_setup.xlsx")
 
@@ -76,7 +95,7 @@ def _sample_setup() -> tuple[list[dict], dict]:
     for fi, floor in enumerate(FLOORS):
         for si, shift in enumerate(SHIFTS):
             seed = fi * 2 + si
-            need = {"KIT": 4 + (seed % 2)}
+            need = {"KIT": 4 + (seed % 2)} if "KIT" in FLOOR_LINE_IDS[floor] else {}
             need.update({f"L{n}": 3 if n in (3 + seed, 10 + seed) else 2 for n in range(1, 19)})
             for lid, n in need.items():
                 reqs[(floor, shift, lid)] = n
@@ -173,7 +192,7 @@ def _new_board(d: date, shift: str, floor: str) -> dict:
     return {
         "date": d, "shift": shift, "floor": floor, "rev": 0,
         "employees": employees,
-        "reqs": {l["id"]: g["reqs"].get((floor, shift, l["id"]), 0) for l in LINES},
+        "reqs": {l["id"]: g["reqs"].get((floor, shift, l["id"]), 0) for l in floor_lines(floor)},
         "assign": {e["id"]: BOX for e in employees},
         "confirmed": {},        # group -> {"by", "t"}
         "finalized": None,      # time attendance became final (all groups confirmed)
@@ -183,7 +202,7 @@ def _new_board(d: date, shift: str, floor: str) -> dict:
         "intervals": [],        # {"eid", "area", "start", "end"}
         "events": [],           # {"t", "kind", "text"}
         "break_from": {},       # eid -> line before a group break
-        "group_break": {g_: False for g_ in BREAK_GROUPS},
+        "group_break": {g_: False for g_ in GROUP_KEYS},
         "last_check": {},       # group -> time
         "ended": None,          # {"by", "t"}
     }
@@ -209,17 +228,17 @@ def short(aid: str | None) -> str:
     return "Box" if aid is BOX else AREA_BY_ID[aid]["short"]
 
 
-def group_of(aid: str) -> str | None:
-    return next((g for g, grp in LEAD_GROUPS.items() if aid in grp["areas"]), None)
+def group_of(b: dict, aid: str) -> str | None:
+    return next((g for g, grp in lead_groups(b["floor"]).items() if aid in grp["areas"]), None)
 
 
 def on_group_break(b: dict, aid: str) -> bool:
-    return any(b["group_break"][g] and aid in grp["areas"] for g, grp in BREAK_GROUPS.items())
+    return any(b["group_break"][g] and aid in grp["areas"] for g, grp in break_groups(b["floor"]).items())
 
 
 def is_short(b: dict, aid: str) -> bool:
     req = b["reqs"].get(aid, 0)
-    return bool(req) and group_of(aid) in b["confirmed"] and not on_group_break(b, aid) and len(crew(b, aid)) < req
+    return bool(req) and group_of(b, aid) in b["confirmed"] and not on_group_break(b, aid) and len(crew(b, aid)) < req
 
 
 # ---------- rules ----------
@@ -232,7 +251,7 @@ def _timed(b: dict, area: str | None) -> bool:
     """Time counts on a line once its lead has confirmed; Break counts once anyone has."""
     if area is BOX:
         return False
-    return bool(b["confirmed"]) if area == "BRK" else group_of(area) in b["confirmed"]
+    return bool(b["confirmed"]) if area == "BRK" else group_of(b, area) in b["confirmed"]
 
 
 def _move(b: dict, eid: str, target: str | None, by: str, log: bool = True) -> None:
@@ -285,12 +304,12 @@ def apply_layout(b: dict, layout: dict[str | None, list[str]], by: str) -> int:
 
 
 def load_usual_layout(b: dict, group: str | None, by: str) -> None:
-    groups = [group] if group else list(LEAD_GROUPS)
+    groups = [group] if group else list(GROUP_KEYS)
     for g in groups:
         if g in b["confirmed"]:
             continue
         for e in crew(b, BOX):
-            if e["home"] in LEAD_GROUPS[g]["areas"]:
+            if e["home"] in lead_groups(b["floor"])[g]["areas"]:
                 _move(b, e["id"], e["home"], by, log=False)
     _save(b)
 
@@ -304,12 +323,12 @@ def confirm_group(b: dict, group: str, by: str) -> None:
     n = 0
     for e in b["employees"]:
         a = b["assign"][e["id"]]
-        if a is not BOX and (a in LEAD_GROUPS[group]["areas"] or a == "BRK") and e["id"] not in b["attendance"]:
+        if a is not BOX and (a in lead_groups(b["floor"])[group]["areas"] or a == "BRK") and e["id"] not in b["attendance"]:
             b["attendance"][e["id"]] = {"status": "Present", "time": t, "by": by}
             b["open"][e["id"]] = (a, t)
             n += 1
-    _log(b, "attendance", f"{LEAD_GROUPS[group]['label']} confirmed by {by}: {n} present")
-    if len(b["confirmed"]) == len(LEAD_GROUPS):
+    _log(b, "attendance", f"{lead_groups(b['floor'])[group]['label']} confirmed by {by}: {n} present")
+    if len(b["confirmed"]) == len(GROUP_KEYS):
         absent = [e for e in crew(b, BOX) if e["id"] not in b["attendance"]]
         for e in absent:
             b["attendance"][e["id"]] = {"status": "Absent", "time": t, "by": by}
@@ -319,8 +338,8 @@ def confirm_group(b: dict, group: str, by: str) -> None:
 
 
 def toggle_group_break(b: dict, g: str, by: str) -> None:
-    grp = BREAK_GROUPS[g]
-    if group_of(grp["areas"][0]) not in b["confirmed"] or b["ended"]:
+    grp = break_groups(b["floor"])[g]
+    if g not in b["confirmed"] or b["ended"]:
         return
     label = grp["label"][0].upper() + grp["label"][1:]
     if not b["group_break"][g]:
@@ -345,7 +364,7 @@ def confirm_board(b: dict, group: str, by: str) -> None:
         return
     late = check_minutes_left(b, group) < 0
     b["last_check"][group] = now()
-    _log(b, "check", f"{LEAD_GROUPS[group]['label']} board confirmed by {by}" + (" (late)" if late else ""))
+    _log(b, "check", f"{lead_groups(b['floor'])[group]['label']} board confirmed by {by}" + (" (late)" if late else ""))
     _save(b)
 
 
@@ -430,7 +449,7 @@ def logout() -> None:
 def user_desc(u: dict) -> str:
     if u["group"] is None:
         return "Supervisor · both floors"
-    return f"{FLOORS[u['floor']]} · {LEAD_GROUPS[u['group']]['label']}"
+    return f"{FLOORS[u['floor']]} · {lead_groups(u['floor'])[u['group']]['label']}"
 
 
 def require_login(purpose: str, supervisors_only: bool = False) -> dict | None:
@@ -487,6 +506,24 @@ button[kind="primary"] p, button[kind="primaryFormSubmit"] p { color:#0B1220 !im
   display:flex; flex-wrap:wrap; gap:6px; align-items:center; color:#E5ECF6; }
 .fb-box b { margin-right:6px; }
 .fb-box.absent .fb-name { background:#FCA5A5; }
+.fb-boxtitle { color:#E5ECF6; font-weight:700; padding:4px 0; }
+.fb-boxtitle span { color:#94A3B8; font-weight:400; }
+.fb-hint { padding:10px 14px; border-radius:12px; background:#FACC15; color:#0B1220; font-weight:600; }
+
+/* tap mode */
+[class*="st-key-chip-"] button { border-radius:999px; border:0; min-height:40px; padding:2px 14px; background:#60A5FA; }
+[class*="st-key-chip-"] button p { color:#0B1220 !important; font-weight:700; }
+[class*="st-key-chip-"] button:hover { filter:brightness(1.1); }
+[class*="st-key-chip-sel-"] button { outline:3px solid #FACC15; outline-offset:2px; transform:scale(1.05); }
+[class*="st-key-chip-dim-"] button { opacity:.7; }
+[class*="st-key-zh-target-"] button { min-height:44px; border:0; background:#FACC15; }
+[class*="st-key-zh-target-"] button p { color:#0B1220 !important; font-weight:700; }
+[class*="st-key-zone-"] { background:#131C2E; border-radius:14px; }
+[class*="st-key-zone-short-"] { border:1px solid #F87171 !important; }
+[class*="st-key-zone-target-"] { border:1px solid #FACC15 !important; }
+[class*="st-key-zone-brk-"] { border:1px dashed #475569 !important; background:#0F1626; }
+[class*="st-key-tapbox-"] { background:#131C2E; border-radius:14px; }
+.fb-zh.short span { color:#FCA5A5; }
 </style>
 """
 
@@ -588,7 +625,7 @@ def _view(floor: str) -> None:
         _pills(b)
         if not b["confirmed"]:
             st.caption("No lead has confirmed attendance yet for this shift.")
-        _read_only_board(b, AREAS)
+        _read_only_board(b, floor_areas(floor))
         _latest(b)
 
     _live()
@@ -653,6 +690,83 @@ def _drag_board(b: dict, areas: list[dict], by: str) -> None:
         st.rerun()
 
 
+def _bk(b: dict) -> str:
+    return board_key(b["date"], b["shift"], b["floor"]).replace("|", "_")
+
+
+def _selected(b: dict) -> str | None:
+    eid = st.session_state.get(f"fb_sel_{_bk(b)}")
+    return eid if eid in b["assign"] else None
+
+
+def _tap_select(b: dict, eid: str) -> None:
+    k = f"fb_sel_{_bk(b)}"
+    st.session_state[k] = None if st.session_state.get(k) == eid else eid
+
+
+def _tap_cancel(b: dict) -> None:
+    st.session_state[f"fb_sel_{_bk(b)}"] = None
+
+
+def _tap_move(b: dict, target: str | None, by: str) -> None:
+    eid = _selected(b)
+    _tap_cancel(b)
+    if eid:
+        apply_layout(b, {target: [eid]}, by)
+
+
+def _chip(b: dict, e: dict, where: str, sel: str | None) -> None:
+    state = "sel" if sel == e["id"] else ("dim" if sel else "n")
+    st.button(e["name"], key=f"chip-{state}-{where}-{_bk(b)}-{e['id']}", on_click=_tap_select, args=(b, e["id"]),
+              width="stretch" if where == "tile" else "content")
+
+
+def _tap_board(b: dict, areas: list[dict], by: str) -> None:
+    """Tap a name, then tap 'Move to …' on the line (same result as dragging)."""
+    sel = _selected(b)
+    if sel:
+        h1, h2 = st.columns([5, 1], vertical_alignment="center")
+        h1.markdown(f"<div class='fb-hint'>Moving {emp(b, sel)['name']} — tap <b>Move to …</b> on the line "
+                    "they're going to.</div>", unsafe_allow_html=True)
+        h2.button("Cancel", on_click=_tap_cancel, args=(b,), width="stretch")
+
+    in_box = crew(b, BOX)
+    with st.container(border=True, key=f"tapbox-{_bk(b)}"):
+        if sel and b["assign"][sel] is not BOX:
+            st.button("Move to the box", key=f"zh-target-{_bk(b)}-BOX", on_click=_tap_move, args=(b, BOX, by),
+                      width="stretch")
+        else:
+            title = "Absent" if b["finalized"] else "Not placed yet"
+            st.markdown(f"<div class='fb-boxtitle'>{title} <span>· {len(in_box)} — tap a name, then tap where "
+                        "they're going</span></div>", unsafe_allow_html=True)
+        with st.container(horizontal=True, wrap=True, gap="small"):
+            for e in in_box:
+                _chip(b, e, "box", sel)
+
+    for i in range(0, len(areas), 5):
+        for col, a in zip(st.columns(5, gap="small"), areas[i:i + 5]):
+            with col:
+                people = crew(b, a["id"])
+                is_target = bool(sel) and b["assign"][sel] != a["id"]
+                on_brk = a["id"] == "BRK" or on_group_break(b, a["id"])
+                state = "target" if is_target else "brk" if on_brk else "short" if is_short(b, a["id"]) else "ok"
+                if a["id"] == "BRK":
+                    count = str(len(people))
+                elif on_group_break(b, a["id"]):
+                    count = "on break"
+                else:
+                    count = f"{len(people)}/{b['reqs'].get(a['id'], 0)}"
+                with st.container(border=True, key=f"zone-{state}-{_bk(b)}-{a['id']}"):
+                    if is_target:
+                        st.button(f"Move to {a['short']}", key=f"zh-target-{_bk(b)}-{a['id']}", on_click=_tap_move,
+                                  args=(b, a["id"], by), width="stretch")
+                    else:
+                        st.markdown(f"<div class='fb-zh {state}'>{a['name']}<span>{count}</span></div>",
+                                    unsafe_allow_html=True)
+                    for e in people:
+                        _chip(b, e, "tile", sel)
+
+
 def update_page() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
     u = require_login("update the floor")
@@ -662,12 +776,12 @@ def update_page() -> None:
     d, s = current_slot()  # only the current shift can be changed
     if u["group"] is None:  # supervisor: either floor, all lines
         floor = _floor_picker("update")
-        groups = list(LEAD_GROUPS)
+        groups = list(GROUP_KEYS)
     else:
         floor = u["floor"]
         groups = [u["group"]]
     b = get_board(d, s, floor)
-    areas = [AREA_BY_ID[a] for g in groups for a in LEAD_GROUPS[g]["areas"]] + [BREAK]
+    areas = [AREA_BY_ID[a] for g in groups for a in lead_groups(floor)[g]["areas"]] + [BREAK]
 
     _title(b, "Floor Board")
     st.caption(f"Signed in as {by} · {user_desc(u)} · {fmt(now())}")
@@ -680,14 +794,14 @@ def update_page() -> None:
 
     # attendance status for every lead on this floor
     status = []
-    for g, grp in LEAD_GROUPS.items():
+    for g, grp in lead_groups(floor).items():
         c = b["confirmed"].get(g)
         status.append(f"{grp['label']}: " + (f"confirmed by {c['by']} at {fmt(c['t'])}" if c else "waiting"))
     st.caption("Attendance · " + " · ".join(status)
                + (" · **final**" if b["finalized"] else " · people left in the box become absent once every lead confirms"))
 
     for g in groups:
-        grp = LEAD_GROUPS[g]
+        grp = lead_groups(floor)[g]
         if g not in b["confirmed"]:
             placed = sum(1 for e in b["employees"] if b["assign"][e["id"]] in grp["areas"])
             c1, c2 = st.columns([1, 2])
@@ -700,7 +814,7 @@ def update_page() -> None:
             pill = (f"<span class='fb-due' style='background:#2A2111;color:#FBBF24'>{grp['label']}: board check due in {left} min</span>"
                     if left >= 0 else
                     f"<span class='fb-due' style='background:#2A1517;color:#FCA5A5'>{grp['label']}: board check overdue by {-left} min</span>")
-            bg = BREAK_GROUPS[g]
+            bg = break_groups(floor)[g]
             brk_label = (f"Bring {bg['label']} back from break" if b["group_break"][g] else f"Send {bg['label']} to break")
             c1, c2, c3 = st.columns([2, 2, 1], vertical_alignment="center")
             c1.markdown(pill, unsafe_allow_html=True)
@@ -708,7 +822,11 @@ def update_page() -> None:
             c3.button("Board is correct", key=f"chk-{g}", type="primary", width="stretch",
                       on_click=confirm_board, args=(b, g, by))
 
-    _drag_board(b, areas, by)
+    mode = st.segmented_control("Move people by", ["Drag", "Tap"], default="Drag", key="fb_move_mode", required=True)
+    if mode == "Tap":
+        _tap_board(b, areas, by)
+    else:
+        _drag_board(b, areas, by)
 
     c1, c2 = st.columns([4, 1], vertical_alignment="center")
     with c1:
@@ -730,7 +848,7 @@ def supervisor_page() -> None:
 
     absent = absent_list(b)
     late = [e for e in b["employees"] if b["attendance"].get(e["id"], {}).get("status") == "Late"]
-    shorts = [a for a in LINES if is_short(b, a["id"])]
+    shorts = [a for a in floor_lines(floor) if is_short(b, a["id"])]
     m = st.columns(5)
     m[0].metric("On lines", sum(1 for e in b["employees"] if b["assign"][e["id"]] not in (BOX, "BRK")))
     m[1].metric("On break", len(crew(b, "BRK")))
@@ -742,7 +860,7 @@ def supervisor_page() -> None:
     with left:
         st.markdown("**Absent**")
         if not b["finalized"]:
-            waiting = [grp["label"] for g, grp in LEAD_GROUPS.items() if g not in b["confirmed"]]
+            waiting = [grp["label"] for g, grp in lead_groups(floor).items() if g not in b["confirmed"]]
             st.caption("Not final yet · waiting on " + ", ".join(waiting))
         if absent:
             st.dataframe(pd.DataFrame([{"Employee": e["name"], "Usual line": AREA_BY_ID[e["home"]]["name"]}
@@ -757,7 +875,7 @@ def supervisor_page() -> None:
         st.markdown("**Needs attention**")
         alerts = 0
         if not b["ended"]:
-            for g, grp in LEAD_GROUPS.items():
+            for g, grp in lead_groups(floor).items():
                 if g in b["confirmed"] and check_minutes_left(b, g) < 0:
                     st.warning(f"{grp['label']}: board check overdue by {-check_minutes_left(b, g)} min")
                     alerts += 1
@@ -770,7 +888,7 @@ def supervisor_page() -> None:
     st.markdown("**Crews**")
     st.dataframe(pd.DataFrame([{"Line": a["name"], "Crew": ", ".join(e["name"] for e in crew(b, a["id"])),
                                 "On line": len(crew(b, a["id"])), "Required": b["reqs"].get(a["id"])}
-                               for a in AREAS]), hide_index=True, width="stretch", height=420)
+                               for a in floor_areas(floor)]), hide_index=True, width="stretch", height=420)
 
 
 # ---------- end of shift (sign-in) ----------
@@ -847,10 +965,10 @@ def _norm_group(v) -> str | None | bool:
     v = str(v).strip().lower()
     if v.startswith("sup") or v in ("all", "both"):
         return None
-    if "kit" in v or v.startswith("a"):
-        return "A"
-    if "10" in v or v.startswith("b"):
+    if "10" in v or "18" in v or v.startswith("b"):
         return "B"
+    if "kit" in v or "1" in v or "9" in v or v.startswith("a"):
+        return "A"
     return False
 
 
@@ -873,13 +991,13 @@ def load_setup(path: Path = DATA_FILE) -> tuple[list[dict], dict, list[dict], li
         if not name or name == "nan":
             continue
         f, s, l = _norm_floor(r.get("Floor")), _norm_shift(r.get("Shift")), _norm_line(r.get("Usual line"))
-        if f and s and l:
+        if f and s and l and l in FLOOR_LINE_IDS[f]:
             roster.append({"floor": f, "shift": s, "name": name, "line": l})
         else:
             errors.append(f"Crew row {i + 2}: check Floor / Shift / Usual line for {name}")
     for i, r in sheets.get("Lines", pd.DataFrame()).iterrows():
         f, s, l = _norm_floor(r.get("Floor")), _norm_shift(r.get("Shift")), _norm_line(r.get("Line"))
-        if f and s and l and not pd.isna(r.get("Required")):
+        if f and s and l and l in FLOOR_LINE_IDS[f] and not pd.isna(r.get("Required")):
             reqs[(f, s, l)] = int(r["Required"])
         else:
             errors.append(f"Lines row {i + 2}: check Floor / Shift / Line / Required")
@@ -904,7 +1022,7 @@ def load_setup(path: Path = DATA_FILE) -> tuple[list[dict], dict, list[dict], li
 def write_setup_template(path: Path) -> None:
     """Writes the setup file filled with the sample data, to edit with the real crews."""
     roster, reqs = _sample_setup()
-    group_names = {**{k: v["label"] for k, v in LEAD_GROUPS.items()}, None: "Supervisor"}
+
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
         pd.DataFrame([{"Floor": FLOORS[r["floor"]], "Shift": r["shift"], "Name": r["name"],
                        "Usual line": AREA_BY_ID[r["line"]]["name"]} for r in roster]
@@ -912,7 +1030,8 @@ def write_setup_template(path: Path) -> None:
         pd.DataFrame([{"Floor": FLOORS[f], "Shift": s, "Line": AREA_BY_ID[l]["name"], "Required": n}
                       for (f, s, l), n in reqs.items()]).to_excel(xw, sheet_name="Lines", index=False)
         pd.DataFrame([{"Name": u["name"], "PIN": u["pin"], "Floor": FLOORS[u["floor"]] if u["floor"] else "Both",
-                       "Lines": group_names[u["group"]]} for u in USERS]).to_excel(xw, sheet_name="Logins", index=False)
+                       "Lines": lead_groups(u["floor"])[u["group"]]["label"] if u["group"] else "Supervisor"}
+                      for u in USERS]).to_excel(xw, sheet_name="Logins", index=False)
 
 
 # ================= navigation =================
