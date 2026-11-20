@@ -23,7 +23,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-from streamlit_sortables import sort_items
 
 # ================= configuration =================
 
@@ -510,36 +509,155 @@ button[kind="primary"] p, button[kind="primaryFormSubmit"] p { color:#0B1220 !im
 .fb-boxtitle span { color:#94A3B8; font-weight:400; }
 .fb-hint { padding:10px 14px; border-radius:12px; background:#FACC15; color:#0B1220; font-weight:600; }
 
-/* tap mode */
-[class*="st-key-chip-"] button { border-radius:999px; border:0; min-height:40px; padding:2px 14px; background:#60A5FA; }
-[class*="st-key-chip-"] button p { color:#0B1220 !important; font-weight:700; }
-[class*="st-key-chip-"] button:hover { filter:brightness(1.1); }
-[class*="st-key-chip-sel-"] button { outline:3px solid #FACC15; outline-offset:2px; transform:scale(1.05); }
-[class*="st-key-chip-dim-"] button { opacity:.7; }
-[class*="st-key-zh-target-"] button { min-height:44px; border:0; background:#FACC15; }
-[class*="st-key-zh-target-"] button p { color:#0B1220 !important; font-weight:700; }
-[class*="st-key-zone-"] { background:#131C2E; border-radius:14px; }
-[class*="st-key-zone-short-"] { border:1px solid #F87171 !important; }
-[class*="st-key-zone-target-"] { border:1px solid #FACC15 !important; }
-[class*="st-key-zone-brk-"] { border:1px dashed #475569 !important; background:#0F1626; }
-[class*="st-key-tapbox-"] { background:#131C2E; border-radius:14px; }
 .fb-zh.short span { color:#FCA5A5; }
 </style>
 """
 
-DRAG_CSS = """
-.sortable-component { display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:8px; align-items:start;
-  border:0; padding:0; background:transparent; }
-.sortable-container { background:#131C2E; border:1px solid #26344D; border-radius:12px; padding:6px; margin:0;
-  min-height:120px; counter-reset:none; }
-.sortable-container:nth-of-type(1) { grid-column:1 / -1; min-height:80px; }
-.sortable-container-header { color:#E5ECF6; font-weight:700; font-size:14px; padding:8px 10px; background:#1B2740;
-  border-radius:8px; margin-bottom:6px; }
-.sortable-container-body { display:flex; flex-wrap:wrap; gap:6px; background:transparent; min-height:60px; }
-.sortable-item { background:#60A5FA; color:#0B1220; border:0; border-radius:999px; padding:9px 14px; margin:0;
-  font-weight:700; font-size:14px; touch-action:none; }
-.sortable-item:hover { filter:brightness(1.1); }
+BOARD_CSS = """
+.fb-board { display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:8px; align-items:start;
+  font-family: "Source Sans Pro", "Source Sans 3", sans-serif; user-select:none; -webkit-user-select:none; }
+.zone { background:#131C2E; border:1px solid #26344D; border-radius:12px; padding:6px; min-height:110px;
+  display:flex; flex-direction:column; gap:6px; cursor:default; }
+.zone.box { grid-column:1 / -1; min-height:70px; }
+.zone.short { border-color:#F87171; }
+.zone.brk { border-style:dashed; border-color:#475569; background:#0F1626; }
+.zone.target { border-color:#FACC15; cursor:pointer; }
+.zone.over { border-color:#FACC15; box-shadow:0 0 0 2px #FACC15 inset; }
+.head { display:flex; justify-content:space-between; align-items:center; gap:6px; min-height:40px; padding:0 10px;
+  border-radius:8px; background:#1B2740; color:#E5ECF6; font-weight:700; font-size:14px; white-space:nowrap; }
+.head span { color:#94A3B8; font-weight:600; }
+.zone.short .head span { color:#FCA5A5; }
+.zone.target .head { background:#FACC15; color:#0B1220; }
+.zone.target .head span { color:#0B1220; }
+.body { display:flex; flex-wrap:wrap; gap:6px; min-height:40px; }
+.chip { background:#60A5FA; color:#0B1220; border:0; border-radius:999px; padding:10px 14px; font-weight:700;
+  font-size:14px; line-height:1; cursor:grab; touch-action:manipulation; font-family:inherit; }
+.zone:not(.box) .chip { flex:1 1 100%; }
+.chip.sel { outline:3px solid #FACC15; outline-offset:2px; }
+.chip.dim { opacity:.7; }
+.chip.dragging { opacity:.35; }
+.ghost { position:fixed; z-index:9999; pointer-events:none; transform:translate(-50%, -50%) scale(1.08);
+  box-shadow:0 8px 24px rgba(0,0,0,.4); }
+.hint { grid-column:1 / -1; padding:10px 14px; border-radius:12px; background:#FACC15; color:#0B1220;
+  font-weight:600; font-size:15px; display:flex; justify-content:space-between; align-items:center; }
+.hint button { background:transparent; border:1px solid #0B1220; border-radius:8px; padding:6px 12px; font-weight:600;
+  color:#0B1220; font-family:inherit; cursor:pointer; }
+.locked .chip { cursor:default; }
 """
+
+BOARD_JS = """
+export default function (component) {
+  const { data, parentElement, setTriggerValue } = component;
+  let root = parentElement.querySelector('.fb-board');
+  if (!root) { root = document.createElement('div'); root.className = 'fb-board'; parentElement.appendChild(root); }
+  const zones = (data && data.zones) || [];
+  const locked = !!(data && data.locked);
+  const where = {};
+  zones.forEach(z => z.people.forEach(p => { where[p.id] = z.id; }));
+  let sel = null;
+
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const send = (eid, to) => { if (!locked && eid && to && where[eid] !== to) setTriggerValue('move', { eid, to, at: Date.now() }); };
+
+  function render() {
+    const selName = sel ? (zones.find(z => z.id === where[sel]).people.find(p => p.id === sel) || {}).name : null;
+    let html = '';
+    if (sel) html += `<div class="hint"><span>Moving ${esc(selName)} — tap the line they're going to, or drag the name.</span><button data-cancel="1">Cancel</button></div>`;
+    zones.forEach(z => {
+      const target = sel && where[sel] !== z.id;
+      const cls = ['zone', z.cls || '', target ? 'target' : ''].join(' ');
+      const right = target ? 'Move here' : esc(z.count || '');
+      const chips = z.people.map(p => {
+        const c = sel === p.id ? 'sel' : (sel ? 'dim' : '');
+        return `<button class="chip ${c}" data-eid="${esc(p.id)}">${esc(p.name)}</button>`;
+      }).join('');
+      html += `<div class="${cls}" data-zone="${esc(z.id)}"><div class="head">${esc(z.title)}<span>${right}</span></div><div class="body">${chips}</div></div>`;
+    });
+    root.className = 'fb-board' + (locked ? ' locked' : '');
+    root.innerHTML = html;
+  }
+  render();
+  if (locked) return;
+
+  // ---- tap: tap a name, then tap a line ----
+  let suppressClick = false;
+  root.onclick = (e) => {
+    if (suppressClick) { suppressClick = false; return; }
+    if (e.target.closest('[data-cancel]')) { sel = null; render(); return; }
+    const chip = e.target.closest('.chip');
+    if (chip) { sel = (sel === chip.dataset.eid) ? null : chip.dataset.eid; render(); return; }
+    const zone = e.target.closest('.zone');
+    if (zone && sel && where[sel] !== zone.dataset.zone) { const eid = sel; sel = null; send(eid, zone.dataset.zone); }
+  };
+
+  // ---- drag: mouse = press and move; touch = press and hold, then move ----
+  const host = root.getRootNode();
+  let drag = null;
+  const zoneAt = (x, y) => { const el = (host.elementFromPoint ? host : document).elementFromPoint(x, y); return el && el.closest ? el.closest('.zone') : null; };
+  function startDrag(chip, x, y) {
+    const ghost = chip.cloneNode(true);
+    ghost.classList.add('ghost'); ghost.classList.remove('sel', 'dim');
+    ghost.style.left = x + 'px'; ghost.style.top = y + 'px';
+    root.appendChild(ghost); chip.classList.add('dragging');
+    drag.ghost = ghost; drag.active = true;
+  }
+  function moveDrag(x, y) {
+    drag.ghost.style.left = x + 'px'; drag.ghost.style.top = y + 'px';
+    root.querySelectorAll('.zone.over').forEach(z => z.classList.remove('over'));
+    const z = zoneAt(x, y); if (z && z.dataset.zone !== drag.from) z.classList.add('over');
+  }
+  function endDrag(x, y) {
+    const z = zoneAt(x, y);
+    drag.ghost.remove(); drag.chip.classList.remove('dragging');
+    root.querySelectorAll('.zone.over').forEach(o => o.classList.remove('over'));
+    suppressClick = true; setTimeout(() => { suppressClick = false; }, 400);
+    const eid = drag.eid, to = z ? z.dataset.zone : null; drag = null; sel = null;
+    if (to && to !== where[eid]) send(eid, to); else render();
+  }
+
+  root.onmousedown = (e) => {
+    const chip = e.target.closest('.chip'); if (!chip || e.button !== 0) return;
+    drag = { chip, eid: chip.dataset.eid, from: where[chip.dataset.eid], x: e.clientX, y: e.clientY, active: false };
+    const mm = (ev) => {
+      if (!drag) return;
+      if (!drag.active && Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y) > 6) startDrag(drag.chip, ev.clientX, ev.clientY);
+      if (drag.active) moveDrag(ev.clientX, ev.clientY);
+    };
+    const mu = (ev) => {
+      window.removeEventListener('mousemove', mm); window.removeEventListener('mouseup', mu);
+      if (drag && drag.active) endDrag(ev.clientX, ev.clientY); else drag = null;
+    };
+    window.addEventListener('mousemove', mm); window.addEventListener('mouseup', mu);
+  };
+
+  if (root._fbTouch) Object.entries(root._fbTouch).forEach(([ev, fn]) => root.removeEventListener(ev, fn));
+  const onTouchStart = (e) => {
+    const chip = e.target.closest('.chip'); if (!chip || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    drag = { chip, eid: chip.dataset.eid, from: where[chip.dataset.eid], x: t.clientX, y: t.clientY, active: false };
+    drag.timer = setTimeout(() => { if (drag) { startDrag(chip, drag.x, drag.y); if (navigator.vibrate) navigator.vibrate(15); } }, 200);
+  };
+  const onTouchMove = (e) => {
+    if (!drag) return;
+    const t = e.touches[0];
+    if (!drag.active) { if (Math.hypot(t.clientX - drag.x, t.clientY - drag.y) > 8) { clearTimeout(drag.timer); drag = null; } return; }
+    e.preventDefault(); drag.lx = t.clientX; drag.ly = t.clientY; moveDrag(t.clientX, t.clientY);
+  };
+  const onTouchEnd = (e) => {
+    if (!drag) return;
+    clearTimeout(drag.timer);
+    if (drag.active) { e.preventDefault(); endDrag(drag.lx ?? drag.x, drag.ly ?? drag.y); } else drag = null;
+  };
+  const onTouchCancel = () => { if (drag) { clearTimeout(drag.timer); if (drag.ghost) drag.ghost.remove(); drag.chip.classList.remove('dragging'); drag = null; } };
+  root.addEventListener('touchstart', onTouchStart, { passive: true });
+  root.addEventListener('touchmove', onTouchMove, { passive: false });
+  root.addEventListener('touchend', onTouchEnd);
+  root.addEventListener('touchcancel', onTouchCancel);
+  root._fbTouch = { touchstart: onTouchStart, touchmove: onTouchMove, touchend: onTouchEnd, touchcancel: onTouchCancel };
+}
+"""
+
+BOARD = st.components.v2.component("floor_board_board", css=BOARD_CSS, js=BOARD_JS)
 
 
 def _slot_picker(key: str) -> tuple[date, str]:
@@ -653,118 +771,32 @@ def _end_dialog(b: dict, by: str) -> None:
         st.rerun()
 
 
-def _drag_board(b: dict, areas: list[dict], by: str) -> None:
-    """Box + the lead's lines + Break as drag-and-drop containers."""
-    labels: dict[str, str] = {}
-    used: dict[str, int] = {}
-    for e in b["employees"]:
-        n = used.get(e["name"], 0) + 1
-        used[e["name"]] = n
-        labels[e["id"]] = e["name"] if n == 1 else f"{e['name']} ({n})"
-    by_label = {v: k for k, v in labels.items()}
-
-    containers = [(BOX, f"{'Absent' if b['finalized'] else 'Not placed yet'} · {len(crew(b, BOX))}  —  "
-                        "press and hold a name, then drag it to a line")]
-    extra_css = []
-    for i, a in enumerate(areas, start=2):  # nth-of-type: the box is 1
-        n = len(crew(b, a["id"]))
+def _board(b: dict, areas: list[dict], by: str) -> None:
+    """Box + the lead's lines + Break. Drag a name to a line, or tap a name and then tap the line."""
+    zones = [{"id": "BOX", "title": "Absent" if b["finalized"] else "Not placed yet",
+              "count": f"{len(crew(b, BOX))} · drag or tap a name", "cls": "box",
+              "people": [{"id": e["id"], "name": e["name"]} for e in crew(b, BOX)]}]
+    for a in areas:
+        people = crew(b, a["id"])
         if a["id"] == "BRK":
-            head = f"Break · {n}"
-            extra_css.append(f".sortable-container:nth-of-type({i}){{border-style:dashed;border-color:#475569;background:#0F1626}}")
+            cls, count = "brk", str(len(people))
         elif on_group_break(b, a["id"]):
-            head = f"{a['name']} · on break"
-            extra_css.append(f".sortable-container:nth-of-type({i}){{border-style:dashed;border-color:#475569}}")
+            cls, count = "brk", "on break"
         else:
-            head = f"{a['name']} · {n}/{b['reqs'].get(a['id'], 0)}"
-            if is_short(b, a["id"]):
-                extra_css.append(f".sortable-container:nth-of-type({i}){{border-color:#F87171}}"
-                                 f".sortable-container:nth-of-type({i}) .sortable-container-header{{color:#FCA5A5}}")
-        containers.append((a["id"], head))
-
-    items = [{"header": head, "items": [labels[e["id"]] for e in crew(b, aid)]} for aid, head in containers]
-    result = sort_items(items, multi_containers=True, direction="horizontal",
-                        custom_style=DRAG_CSS + "".join(extra_css),
-                        key=f"drag-{board_key(b['date'], b['shift'], b['floor'])}-{b['rev']}-{len(areas)}")
-    layout = {aid: [by_label[x] for x in c["items"] if x in by_label] for (aid, _), c in zip(containers, result)}
-    if apply_layout(b, layout, by):
-        st.rerun()
+            cls, count = ("short" if is_short(b, a["id"]) else ""), f"{len(people)}/{b['reqs'].get(a['id'], 0)}"
+        zones.append({"id": a["id"], "title": a["name"], "count": count, "cls": cls,
+                      "people": [{"id": e["id"], "name": e["name"]} for e in people]})
+    res = BOARD(data={"zones": zones, "locked": bool(b["ended"])}, key=f"board-{_bk(b)}", on_move_change=lambda: None)
+    mv = getattr(res, "move", None)
+    if mv and mv.get("eid") in b["assign"]:
+        target = None if mv.get("to") == "BOX" else mv.get("to")
+        if target is BOX or target in AREA_BY_ID:
+            apply_layout(b, {target: [mv["eid"]]}, by)
+            st.rerun()
 
 
 def _bk(b: dict) -> str:
     return board_key(b["date"], b["shift"], b["floor"]).replace("|", "_")
-
-
-def _selected(b: dict) -> str | None:
-    eid = st.session_state.get(f"fb_sel_{_bk(b)}")
-    return eid if eid in b["assign"] else None
-
-
-def _tap_select(b: dict, eid: str) -> None:
-    k = f"fb_sel_{_bk(b)}"
-    st.session_state[k] = None if st.session_state.get(k) == eid else eid
-
-
-def _tap_cancel(b: dict) -> None:
-    st.session_state[f"fb_sel_{_bk(b)}"] = None
-
-
-def _tap_move(b: dict, target: str | None, by: str) -> None:
-    eid = _selected(b)
-    _tap_cancel(b)
-    if eid:
-        apply_layout(b, {target: [eid]}, by)
-
-
-def _chip(b: dict, e: dict, where: str, sel: str | None) -> None:
-    state = "sel" if sel == e["id"] else ("dim" if sel else "n")
-    st.button(e["name"], key=f"chip-{state}-{where}-{_bk(b)}-{e['id']}", on_click=_tap_select, args=(b, e["id"]),
-              width="stretch" if where == "tile" else "content")
-
-
-def _tap_board(b: dict, areas: list[dict], by: str) -> None:
-    """Tap a name, then tap 'Move to …' on the line (same result as dragging)."""
-    sel = _selected(b)
-    if sel:
-        h1, h2 = st.columns([5, 1], vertical_alignment="center")
-        h1.markdown(f"<div class='fb-hint'>Moving {emp(b, sel)['name']} — tap <b>Move to …</b> on the line "
-                    "they're going to.</div>", unsafe_allow_html=True)
-        h2.button("Cancel", on_click=_tap_cancel, args=(b,), width="stretch")
-
-    in_box = crew(b, BOX)
-    with st.container(border=True, key=f"tapbox-{_bk(b)}"):
-        if sel and b["assign"][sel] is not BOX:
-            st.button("Move to the box", key=f"zh-target-{_bk(b)}-BOX", on_click=_tap_move, args=(b, BOX, by),
-                      width="stretch")
-        else:
-            title = "Absent" if b["finalized"] else "Not placed yet"
-            st.markdown(f"<div class='fb-boxtitle'>{title} <span>· {len(in_box)} — tap a name, then tap where "
-                        "they're going</span></div>", unsafe_allow_html=True)
-        with st.container(horizontal=True, wrap=True, gap="small"):
-            for e in in_box:
-                _chip(b, e, "box", sel)
-
-    for i in range(0, len(areas), 5):
-        for col, a in zip(st.columns(5, gap="small"), areas[i:i + 5]):
-            with col:
-                people = crew(b, a["id"])
-                is_target = bool(sel) and b["assign"][sel] != a["id"]
-                on_brk = a["id"] == "BRK" or on_group_break(b, a["id"])
-                state = "target" if is_target else "brk" if on_brk else "short" if is_short(b, a["id"]) else "ok"
-                if a["id"] == "BRK":
-                    count = str(len(people))
-                elif on_group_break(b, a["id"]):
-                    count = "on break"
-                else:
-                    count = f"{len(people)}/{b['reqs'].get(a['id'], 0)}"
-                with st.container(border=True, key=f"zone-{state}-{_bk(b)}-{a['id']}"):
-                    if is_target:
-                        st.button(f"Move to {a['short']}", key=f"zh-target-{_bk(b)}-{a['id']}", on_click=_tap_move,
-                                  args=(b, a["id"], by), width="stretch")
-                    else:
-                        st.markdown(f"<div class='fb-zh {state}'>{a['name']}<span>{count}</span></div>",
-                                    unsafe_allow_html=True)
-                    for e in people:
-                        _chip(b, e, "tile", sel)
 
 
 def update_page() -> None:
@@ -822,11 +854,7 @@ def update_page() -> None:
             c3.button("Board is correct", key=f"chk-{g}", type="primary", width="stretch",
                       on_click=confirm_board, args=(b, g, by))
 
-    mode = st.segmented_control("Move people by", ["Drag", "Tap"], default="Drag", key="fb_move_mode", required=True)
-    if mode == "Tap":
-        _tap_board(b, areas, by)
-    else:
-        _drag_board(b, areas, by)
+    _board(b, areas, by)
 
     c1, c2 = st.columns([4, 1], vertical_alignment="center")
     with c1:
